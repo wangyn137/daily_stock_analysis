@@ -6,12 +6,12 @@ strategies: growth_quality, expectation_repricing, wave_theory, chan_theory.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from src.agent.factory import build_agent_executor
+from src.agent.executor import AgentResult
 from src.schemas.position_schemas import (
     CycleAnalysisResult,
     Position,
@@ -83,23 +83,9 @@ class PositionCycleAnalyzer:
         ctx: PositionContext,
     ) -> str:
         """Run agent executor with long-term strategies."""
-        system_prompt = self._build_system_prompt(position, ctx)
-        executor = build_agent_executor(
-            skills=self.agent_skills,
-            system_prompt=system_prompt,
-        )
-        user_message = (
-            f"请对 {position.name} ({position.code}) 进行中长期持仓分析。"
-            f"当前价格: {ctx.current_price:.2f}, 成本价: {position.cost_price:.2f}, "
-            f"持仓天数: {ctx.holding_period}天。请给出阶段建议（建仓/加仓/持有/减仓/清仓）。"
-        )
-        result = executor.invoke({"input": user_message})
-        return str(result.get("output", ""))
-
-    def _build_system_prompt(self, position: Position, ctx: PositionContext) -> str:
-        """Build system prompt for position cycle analysis."""
+        executor = build_agent_executor(skills=self.agent_skills)
         name = position.name or position.code
-        return (
+        user_message = (
             f"你是一个中长期持仓投资顾问。请分析 {name} ({position.code}) 的持仓周期。\n"
             f"成本价: {position.cost_price:.2f}, 当前价: {ctx.current_price:.2f}, "
             f"持仓天数: {ctx.holding_period}天。\n"
@@ -121,6 +107,8 @@ class PositionCycleAnalyzer:
             f"风险提示: [- 风险1\\n- 风险2]\n"
             f"催化剂: [- 催化剂1\\n- 催化剂2]"
         )
+        result: AgentResult = executor.run(task=user_message)
+        return result.content
 
     def _parse_agent_result(self, position: Position, raw: str) -> CycleAnalysisResult:
         """Parse agent output into structured CycleAnalysisResult."""
