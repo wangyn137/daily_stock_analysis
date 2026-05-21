@@ -93,3 +93,22 @@ def format_portfolio_report(report: PositionAnalysisReport) -> str:
     ]
 
     return "\n".join(header + sections + footer)
+
+
+def send_report_via_feishu(
+    report: PositionAnalysisReport,
+    feishu_sender,
+    title: str = "📊 持仓分析报告",
+) -> bool:
+    """Send formatted portfolio report via Feishu.
+
+    Args:
+        report: The position analysis report to send.
+        feishu_sender: An instance of FeishuSender.
+        title: Optional title prefix (ignored, Feishu card uses its own header).
+
+    Returns:
+        True if sent successfully.
+    """
+    report_text = format_portfolio_report(report)
+    return feishu_sender.send_to_feishu(report_text)
