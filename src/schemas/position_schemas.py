@@ -49,9 +49,9 @@ class CycleAnalysisResult:
                 f"sentiment_score must be 0-100, got {self.sentiment_score}"
             )
     trend_prediction: str  # 看多/震荡/看空
+    confidence_level: str  # 高/中/低
     target_price: Optional[float] = None
     stop_loss: Optional[float] = None
-    confidence_level: str  # 高/中/低
     reason: str = ""
     action_checklist: List[str] = field(default_factory=list)
     risk_alerts: List[str] = field(default_factory=list)
