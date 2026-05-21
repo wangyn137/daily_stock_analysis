@@ -267,3 +267,44 @@ class PortfolioRiskResponse(BaseModel):
     sector_concentration: Dict[str, Any] = Field(default_factory=dict)
     drawdown: Dict[str, Any] = Field(default_factory=dict)
     stop_loss: Dict[str, Any] = Field(default_factory=dict)
+
+
+# === Position Cycle Advisor Schemas ===
+
+
+class PositionAnalysisRequest(BaseModel):
+    """Request to trigger position analysis."""
+    codes: Optional[List[str]] = None  # empty = all positions
+    trigger_type: str = "manual"  # manual | threshold | event
+
+
+class PositionAnalysisJobResponse(BaseModel):
+    """Response for submitted analysis job."""
+    success: bool
+    job_id: str
+    estimated_completion: Optional[str] = None
+
+
+class CycleAnalysisItem(BaseModel):
+    """Single stock cycle analysis result in API response."""
+    code: str
+    name: str = ""
+    decision: str = "持有"
+    sentiment_score: int = 50
+    trend_prediction: str = "震荡"
+    target_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    confidence_level: str = "中"
+    reason: str = ""
+    action_checklist: List[str] = []
+    risk_alerts: List[str] = []
+    catalysts: List[str] = []
+
+
+class PositionAnalysisReportResponse(BaseModel):
+    """Position analysis report response."""
+    job_id: str
+    status: str  # pending | running | completed | failed
+    reports: List[CycleAnalysisItem] = []
+    summary: str = ""
+    generated_at: str = ""

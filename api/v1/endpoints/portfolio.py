@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
-from typing import Optional
+import uuid
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.portfolio import (
+    CycleAnalysisItem,
+    PositionAnalysisJobResponse,
+    PositionAnalysisReportResponse,
+    PositionAnalysisRequest,
     PortfolioAccountCreateRequest,
     PortfolioAccountItem,
     PortfolioAccountListResponse,
@@ -33,6 +38,7 @@ from api.v1.schemas.portfolio import (
 )
 from src.services.portfolio_import_service import PortfolioImportService
 from src.services.portfolio_risk_service import PortfolioRiskService
+from src.services.position_cycle_analyzer import PositionCycleAnalyzer
 from src.services.portfolio_service import (
     PortfolioBusyError,
     PortfolioConflictError,
@@ -565,3 +571,109 @@ def get_risk_report(
         raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Get risk report failed", exc)
+
+
+# === Position Cycle Advisor Endpoints ===
+
+
+_analysis_jobs: Dict[str, Dict[str, Any]] = {}
+_analyzer = PositionCycleAnalyzer()
+_portfolio_svc_for_analysis = PortfolioService()
+
+
+@router.post("/analyze", response_model=PositionAnalysisJobResponse)
+async def trigger_position_analysis(
+    request: PositionAnalysisRequest,
+):
+    """Trigger position cycle analysis."""
+    job_id = str(uuid.uuid4())
+    _analysis_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "reports": [],
+        "summary": "",
+        "generated_at": "",
+    }
+
+    try:
+        # Get current positions from portfolio snapshot
+        snapshot = _portfolio_svc_for_analysis.get_portfolio_snapshot()
+        positions = []
+        for acct in snapshot.get("accounts", []):
+            for pos in acct.get("positions", []):
+                positions.append(pos)
+
+        if request.codes:
+            positions = [p for p in positions if p["symbol"] in request.codes]
+
+        if not positions:
+            _analysis_jobs[job_id]["status"] = "completed"
+            _analysis_jobs[job_id]["summary"] = "当前无持仓数据"
+            return PositionAnalysisJobResponse(
+                success=True, job_id=job_id,
+            )
+
+        # Get current prices for each position (use snapshot price directly)
+        prices = {}
+        for pos in positions:
+            prices[pos["symbol"]] = float(pos.get("last_price", 0.0) or pos.get("avg_cost", 0.0))
+
+        # Build Position objects and run analysis
+        from src.schemas.position_schemas import Position
+        pos_objects = [
+            Position(
+                code=p["symbol"],
+                name="",
+                quantity=int(p.get("quantity", 0)),
+                cost_price=float(p.get("avg_cost", 0.0)),
+                buy_date=None,
+            )
+            for p in positions
+        ]
+
+        report = _analyzer.analyze_portfolio(pos_objects, prices)
+
+        _analysis_jobs[job_id]["status"] = "completed"
+        _analysis_jobs[job_id]["reports"] = [
+            CycleAnalysisItem(
+                code=r.code, name=r.name, decision=r.decision,
+                sentiment_score=r.sentiment_score,
+                trend_prediction=r.trend_prediction,
+                target_price=r.target_price,
+                stop_loss=r.stop_loss,
+                confidence_level=r.confidence_level,
+                reason=r.reason,
+                action_checklist=r.action_checklist,
+                risk_alerts=r.risk_alerts,
+                catalysts=r.catalysts,
+            )
+            for r in report.reports
+        ]
+        _analysis_jobs[job_id]["summary"] = report.summary
+        _analysis_jobs[job_id]["generated_at"] = report.generated_at
+
+    except Exception as exc:
+        _analysis_jobs[job_id]["status"] = "failed"
+        logger.error("Position analysis failed: %s", exc)
+
+    return PositionAnalysisJobResponse(
+        success=True,
+        job_id=job_id,
+        estimated_completion=datetime.now().isoformat(),
+    )
+
+
+@router.get("/reports/{job_id}", response_model=PositionAnalysisReportResponse)
+async def get_position_report(job_id: str):
+    """Get position analysis report by job ID."""
+    job = _analysis_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    return PositionAnalysisReportResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        reports=job.get("reports", []),
+        summary=job.get("summary", ""),
+        generated_at=job.get("generated_at", ""),
+    )
