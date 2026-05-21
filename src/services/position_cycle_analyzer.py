@@ -8,10 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
-
-from src.agent.factory import build_agent_executor
-from src.agent.executor import AgentResult
+from typing import Dict, List, Optional
 from src.schemas.position_schemas import (
     CycleAnalysisResult,
     Position,
@@ -37,8 +34,10 @@ class PositionCycleAnalyzer:
         self,
         *,
         agent_skills: Optional[List[str]] = None,
+        target_return: float = 15.0,
     ):
         self.agent_skills = agent_skills or LONG_TERM_STRATEGIES
+        self._target_return = target_return
 
     def build_context(self, position: Position, current_price: float) -> PositionContext:
         """Build PositionContext from a single position."""
@@ -46,7 +45,6 @@ class PositionCycleAnalyzer:
         if position.buy_date:
             holding_period = (date.today() - position.buy_date).days
         total_value = position.quantity * current_price
-        cost_total = position.quantity * position.cost_price
         historical_return = ((current_price - position.cost_price) / position.cost_price) * 100
 
         return PositionContext(
@@ -54,7 +52,7 @@ class PositionCycleAnalyzer:
             average_cost=position.cost_price,
             total_value=total_value,
             holding_period=holding_period,
-            target_return=15.0,
+            target_return=self._target_return,
             current_price=current_price,
             market_context={
                 "holding_return": round(historical_return, 2),
@@ -72,7 +70,10 @@ class PositionCycleAnalyzer:
 
         try:
             agent_result = self._run_agent_analysis(position, ctx)
-            return self._parse_agent_result(position, agent_result)
+            result = self._parse_agent_result(position, agent_result)
+            result.historical_return = ctx.market_context["holding_return"]
+            result.holding_period_days = ctx.holding_period
+            return result
         except Exception as exc:
             logger.exception("Agent analysis failed for %s", position.code)
             return self._fallback_result(position, str(exc))
@@ -83,6 +84,7 @@ class PositionCycleAnalyzer:
         ctx: PositionContext,
     ) -> str:
         """Run agent executor with long-term strategies."""
+        from src.agent.factory import build_agent_executor
         executor = build_agent_executor(skills=self.agent_skills)
         name = position.name or position.code
         user_message = (
@@ -107,7 +109,11 @@ class PositionCycleAnalyzer:
             f"风险提示: [- 风险1\\n- 风险2]\n"
             f"催化剂: [- 催化剂1\\n- 催化剂2]"
         )
-        result: AgentResult = executor.run(task=user_message)
+        result = executor.chat(
+            message=user_message,
+            session_id=f"pos-{position.code}",
+            context={"stock_code": position.code},
+        )
         return result.content
 
     def _parse_agent_result(self, position: Position, raw: str) -> CycleAnalysisResult:
