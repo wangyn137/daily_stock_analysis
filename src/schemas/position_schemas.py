@@ -7,6 +7,12 @@ from datetime import date
 from typing import List, Optional
 
 
+def _validate_sentiment_score(score: int) -> int:
+    if not (0 <= score <= 100):
+        raise ValueError(f"sentiment_score must be 0-100, got {score}")
+    return score
+
+
 @dataclass
 class Position:
     """Single position data."""
@@ -36,6 +42,12 @@ class CycleAnalysisResult:
     name: str
     decision: str  # 建仓/加仓/持有/减仓/清仓
     sentiment_score: int  # 0-100
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.sentiment_score <= 100):
+            raise ValueError(
+                f"sentiment_score must be 0-100, got {self.sentiment_score}"
+            )
     trend_prediction: str  # 看多/震荡/看空
     target_price: Optional[float] = None
     stop_loss: Optional[float] = None
