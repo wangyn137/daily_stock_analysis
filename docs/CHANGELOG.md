@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] AlphaVantage 适配器在 newest-first 原始数据下 pct_chg 计算错误：改为先按日期升序排序再计算涨跌幅。
 - [修复] 美股日线路由未包含 Finnhub / AlphaVantage：扩展 `get_daily_data()` 美股分支的 source_order 以覆盖新增数据源。
 - [文档] 新增小白客户端安装与配置指南，说明桌面客户端下载、基础模型配置、新闻源配置和常见问题。
+- [新功能] 新增中长期持仓投资顾问系统
+- [新功能] PositionCycleAnalyzer - 中长期持仓分析器
+- [新功能] TriggerEngine - 三种触发模式（定期/阈值/事件）
+- [新功能] PortfolioReportFormatter - 持仓报告格式化
+- [新功能] API 端点 POST /api/v1/portfolio/analyze + GET /api/v1/portfolio/reports/{job_id}
+- [新功能] 飞书持仓报告推送
 - [新功能] Web 首页个股分析支持选择策略。
 - [新功能] 新增热点题材、事件驱动、成长质量和预期重估策略。
 - [新功能] Web 新增告警中心 MVP，支持现有三类告警规则的创建、列表、启停、删除、dry-run 测试和触发历史查看。
