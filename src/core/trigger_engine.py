@@ -10,9 +10,9 @@ Supports three trigger modes:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, Set
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable, Dict, List, Optional
 
 from src.config import Config
 
@@ -71,7 +71,11 @@ class TriggerEngine:
             "monday": 0, "tuesday": 1, "wednesday": 2,
             "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
         }
-        target_dow = day_map.get(self.config.portfolio_weekly_day.lower(), 0)
+        day_name = self.config.portfolio_weekly_day.lower()
+        target_dow = day_map.get(day_name)
+        if target_dow is None:
+            logger.warning("Unrecognized day '%s', defaulting to Monday", day_name)
+            target_dow = 0
         if now.weekday() != target_dow:
             return None
         if now.hour != self.config.portfolio_weekly_hour:
@@ -96,6 +100,10 @@ class TriggerEngine:
         if not self._enabled:
             return None
         now = now or datetime.now()
+
+        if cost_price == 0:
+            logger.warning("cost_price is zero for %s, skipping threshold check", code)
+            return None
 
         # Check cooldown
         state = self._threshold_states.get(code)
@@ -128,6 +136,7 @@ class TriggerEngine:
         code: str,
         event_type: str,
         detail: str = "",
+        now: Optional[datetime] = None,
     ) -> Optional[TriggerEvent]:
         """Check and fire an event-based trigger."""
         if not self._enabled:
@@ -136,11 +145,12 @@ class TriggerEngine:
         if event_type not in supported_events:
             logger.warning("Unsupported event type: %s", event_type)
             return None
+        now = now or datetime.now()
         return TriggerEvent(
             trigger_type="event",
             stock_codes=[code],
             event_detail=f"{event_type}: {detail}",
-            triggered_at=datetime.now().isoformat(),
+            triggered_at=now.isoformat(),
         )
 
     def fire(self, event: TriggerEvent) -> None:
