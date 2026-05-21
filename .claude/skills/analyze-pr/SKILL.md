@@ -29,7 +29,14 @@ gh pr diff <pr_number> --repo ZhuLinsen/daily_stock_analysis
 gh run view <run_id> --log-failed
 ```
 
-### Step 2: 按仓库模板检查描述完整性
+### Step 2: 检查标题与描述完整性
+
+先检查 PR title 是否符合 `AGENTS.md` 的非阻断建议：
+
+- 格式应为 `<类型>: <修改内容>`，例如 `fix: 修复大盘分析历史记录丢失`
+- 类型优先为 `fix`/`feat`/`refactor`/`docs`/`chore`/`test`/`ci`
+- 不应包含 `[codex]`、`codex`、`autocode`、`copilot` 或其他工具/agent 来源前缀
+- 标题应描述实际变更；若标题与 diff 不符，在描述完整性中指出，但不应单独作为 review process blocker。
 
 对照 `.github/PULL_REQUEST_TEMPLATE.md`，确认是否覆盖：
 
@@ -40,6 +47,14 @@ gh run view <run_id> --log-failed
 - `Verification Commands And Results`
 - `Compatibility And Risk`
 - `Rollback Plan`
+
+若 PR 涉及第三方模型 / API 兼容语义、请求参数固定值、OpenAI-compatible 路由、YAML alias、fallback 行为或运行时配置保存 / 清理 / 迁移逻辑，还要额外检查描述里是否明确写出：
+
+- 官方来源链接或公告
+- 当前锁定依赖 / 运行时兼容范围（例如 LiteLLM 版本窗口）
+- 已验证的调用链路覆盖面
+- 旧配置是否会被静默改写、清空、迁移或保持不变
+- 最小回滚路径（通常是 revert 本 PR）
 
 ### Step 3: 优先使用 CI / Diff 证据
 
@@ -83,6 +98,7 @@ gh run view <run_id> --log-failed
 - 必要性：
 - 是否有对应 issue：
 - PR 类型：
+- PR title：
 - description 完整性：
 - 验证情况：
 - 主要风险：
@@ -98,6 +114,9 @@ gh run view <run_id> --log-failed
 - API / Web / Desktop：
 - 配置 / Docker / GitHub Actions：
 - fallback / 通知 / 报告结构：
+- 第三方依赖 / 官方约束来源：
+- 运行时兼容窗口 / 已覆盖链路：
+- 旧配置迁移或静默改写风险：
 
 ## Draft Review Comment
 

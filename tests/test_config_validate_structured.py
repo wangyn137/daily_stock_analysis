@@ -54,6 +54,7 @@ def _make_config(**kwargs) -> Config:
         discord_bot_token=None,
         discord_main_channel_id=None,
         discord_webhook_url=None,
+        discord_interactions_public_key=None,
         llm_channels=[],
         litellm_config_path=None,
         gemini_api_key=None,
@@ -124,6 +125,57 @@ class TestValidateStructuredStockList:
         issues = cfg.validate_structured()
         assert not any(i.field == "STOCK_LIST" for i in issues if i.severity == "error")
 
+    def test_stock_email_groups_outside_stock_list_is_warning(self):
+        cfg = _make_config(
+            stock_list=["600519"],
+            stock_email_groups=[(["600519", "000001"], ["group@example.com"])],
+        )
+        issues = cfg.validate_structured()
+        warning = next(i for i in issues if i.field == "STOCK_GROUP_N")
+        assert warning.severity == "warning"
+        assert "000001" in warning.message
+        assert "邮件路由" in warning.message
+        assert "STOCK_LIST" in warning.message
+
+    def test_stock_email_groups_subset_of_stock_list_has_no_warning(self):
+        cfg = _make_config(
+            stock_list=["600519", "000001"],
+            stock_email_groups=[(["600519"], ["group@example.com"])],
+        )
+        issues = cfg.validate_structured()
+        assert not any(i.field == "STOCK_GROUP_N" for i in issues)
+
+    def test_stock_email_groups_canonical_normalization_no_false_warning(self):
+        """Equivalent stock code formats (SH600519 vs 600519, 1810.HK vs HK01810)
+        should not trigger a subset warning after canonical normalization."""
+        cfg = _make_config(
+            stock_list=["600519", "HK00700"],
+            stock_email_groups=[
+                (["SH600519", "1810.HK"], ["group@example.com"]),
+            ],
+        )
+        issues = cfg.validate_structured()
+        group_warnings = [i for i in issues if i.field == "STOCK_GROUP_N"]
+        # SH600519 normalizes to 600519 (present in stock_list)
+        # 1810.HK normalizes to HK01810 (NOT present — HK00700 ≠ HK01810)
+        assert len(group_warnings) == 1
+        assert "HK01810" in group_warnings[0].message
+        assert "600519" not in group_warnings[0].message
+
+    def test_stock_email_groups_warning_normalizes_and_deduplicates_codes(self):
+        cfg = _make_config(
+            stock_list=["600519"],
+            stock_email_groups=[
+                (["  aapl ", "AAPL", "aapl", " "], ["group@example.com"]),
+            ],
+        )
+        issues = cfg.validate_structured()
+        warning = next(i for i in issues if i.field == "STOCK_GROUP_N")
+        assert warning.severity == "warning"
+        assert "AAPL" in warning.message
+        assert "  aapl " not in warning.message
+        assert warning.message.count("AAPL") == 1
+
 
 # ---------------------------------------------------------------------------
 # validate_structured() — LLM availability (three-tier check)
@@ -134,7 +186,7 @@ class TestValidateStructuredLLM:
         """Empty llm_model_list must produce an error regardless of legacy keys."""
         cfg = _make_config(llm_model_list=[])
         issues = cfg.validate_structured()
-        assert any(i.severity == "error" and "LLM" in i.message for i in issues)
+        assert any(i.severity == "error" and "AI 模型" in i.message for i in issues)
 
     def test_llm_channels_only_no_error(self):
         """LLM_CHANNELS populated via llm_model_list must NOT trigger an error.
@@ -203,6 +255,8 @@ class TestValidateStructuredLLM:
         llm_issues = [i for i in issues if "LITELLM_MODEL" in i.field]
         assert llm_issues, "Expected an info issue about LITELLM_MODEL"
         assert all(i.severity == "info" for i in llm_issues)
+        assert all("LITELLM_MODEL" not in i.message for i in llm_issues)
+        assert any("主模型" in i.message for i in llm_issues)
 
     def test_direct_env_provider_model_without_model_list_no_error(self):
         """Direct LiteLLM env providers should count as configured for runtime."""
@@ -221,7 +275,10 @@ class TestValidateStructuredLLM:
             litellm_model="openai/gpt-4o",
         )
         issues = cfg.validate_structured()
-        assert any(i.severity == "error" and i.field == "LITELLM_MODEL" for i in issues)
+        matching_issues = [i for i in issues if i.severity == "error" and i.field == "LITELLM_MODEL"]
+        assert matching_issues
+        assert all("LITELLM_MODEL" not in i.message for i in matching_issues)
+        assert any("主模型" in i.message for i in matching_issues)
 
     def test_configured_agent_primary_model_missing_from_channels_is_error(self):
         cfg = _make_config(
@@ -279,6 +336,116 @@ class TestValidateStructuredNotification:
         cfg = _make_config(wechat_webhook_url="https://example.com/wh")
         issues = cfg.validate_structured()
         assert not any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_astrbot_url_counts_as_notification_channel(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            astrbot_url="https://astrbot.example/webhook",
+        )
+        issues = cfg.validate_structured()
+        assert not any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_ntfy_url_without_topic_reports_error_and_does_not_count_as_channel(self):
+        cfg = _make_config(wechat_webhook_url=None, ntfy_url="https://ntfy.sh")
+        issues = cfg.validate_structured()
+
+        assert any(i.severity == "error" and i.field == "NTFY_URL" for i in issues)
+        assert any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_ntfy_encoded_blank_topic_reports_error_and_does_not_count_as_channel(self):
+        cfg = _make_config(wechat_webhook_url=None, ntfy_url="https://ntfy.sh/%20")
+        issues = cfg.validate_structured()
+
+        assert any(i.severity == "error" and i.field == "NTFY_URL" for i in issues)
+        assert any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_ntfy_topic_endpoint_counts_as_notification_channel(self):
+        cfg = _make_config(wechat_webhook_url=None, ntfy_url="https://ntfy.sh/dsa-topic")
+        issues = cfg.validate_structured()
+
+        assert not any(i.field == "NTFY_URL" for i in issues)
+        assert not any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_gotify_url_and_token_count_as_notification_channel(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            gotify_url="https://gotify.example",
+            gotify_token="app-token",
+        )
+        issues = cfg.validate_structured()
+
+        assert not any(i.field == "GOTIFY_URL" for i in issues)
+        assert not any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_gotify_blank_token_does_not_count_as_notification_channel(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            gotify_url="https://gotify.example",
+            gotify_token="   ",
+        )
+        issues = cfg.validate_structured()
+
+        assert any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+        assert any(i.severity == "warning" and i.field == "GOTIFY_TOKEN" for i in issues)
+
+    def test_gotify_message_endpoint_reports_error_and_does_not_count_as_channel(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            gotify_url="https://gotify.example/message",
+            gotify_token="app-token",
+        )
+        issues = cfg.validate_structured()
+
+        assert any(i.severity == "error" and i.field == "GOTIFY_URL" for i in issues)
+        assert any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
+    def test_feishu_app_credentials_without_webhook_warns_mode_mismatch(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            feishu_app_id="cli_xxx",
+            feishu_app_secret="secret_xxx",
+            feishu_webhook_url=None,
+            feishu_stream_enabled=False,
+        )
+        issues = cfg.validate_structured()
+        warn = [i for i in issues if i.severity == "warning"]
+        assert any("FEISHU_APP_ID / FEISHU_APP_SECRET" in i.message for i in warn)
+
+    def test_feishu_cloud_doc_credentials_without_webhook_no_mode_warning(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            feishu_app_id="cli_xxx",
+            feishu_app_secret="secret_xxx",
+            feishu_folder_token="folder_xxx",
+            feishu_webhook_url=None,
+            feishu_stream_enabled=False,
+        )
+        issues = cfg.validate_structured()
+        warn = [i for i in issues if i.severity == "warning"]
+        assert not any("FEISHU_APP_ID / FEISHU_APP_SECRET" in i.message for i in warn)
+
+    def test_invalid_notification_noise_config_reports_errors(self):
+        cfg = _make_config(
+            notification_quiet_hours="9:00-18:00",
+            notification_timezone="Mars/Olympus",
+            notification_min_severity="notice",
+        )
+        issues = cfg.validate_structured()
+        errors = {(i.field, i.severity) for i in issues}
+
+        assert ("NOTIFICATION_QUIET_HOURS", "error") in errors
+        assert ("NOTIFICATION_TIMEZONE", "error") in errors
+        assert ("NOTIFICATION_MIN_SEVERITY", "error") in errors
+
+    def test_daily_digest_reserved_flag_warns_without_blocking(self):
+        cfg = _make_config(notification_daily_digest_enabled=True)
+        issues = cfg.validate_structured()
+
+        assert any(
+            issue.field == "NOTIFICATION_DAILY_DIGEST_ENABLED"
+            and issue.severity == "warning"
+            for issue in issues
+        )
 
     def test_no_search_engine_is_info(self):
         cfg = _make_config(searxng_public_instances_enabled=False)
@@ -445,6 +612,24 @@ class TestEnvAliasCompatibility:
 
         assert config.discord_main_channel_id == "main-channel"
 
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_discord_interactions_public_key_is_loaded(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ):
+        with patch.dict(
+            "os.environ",
+            {
+                "DISCORD_INTERACTIONS_PUBLIC_KEY": "abcdef123456",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        assert config.discord_interactions_public_key == "abcdef123456"
+
 
 # ---------------------------------------------------------------------------
 # validate() backward compatibility
@@ -460,7 +645,7 @@ class TestValidateBackwardCompat:
     def test_empty_llm_model_list_message_in_validate(self):
         cfg = _make_config(llm_model_list=[])
         messages = cfg.validate()
-        assert any("LLM" in m for m in messages)
+        assert any("AI 模型" in m for m in messages)
 
     def test_messages_match_validate_structured(self):
         """validate() strings must be the message field of each ConfigIssue."""
