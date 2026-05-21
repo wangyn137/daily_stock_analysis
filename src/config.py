@@ -831,6 +831,15 @@ class Config:
     portfolio_risk_lookback_days: int = 180
     portfolio_fx_update_enabled: bool = True
 
+    # === Position Cycle Advisor Config ===
+    PORTFOLIO_TRIGGER_ENABLED: bool = True
+    PORTFOLIO_WEEKLY_DAY: str = "monday"
+    PORTFOLIO_WEEKLY_HOUR: int = 9
+    PORTFOLIO_WEEKLY_MINUTE: int = 0
+    PORTFOLIO_THRESHOLD_PCT: float = 10.0
+    PORTFOLIO_THRESHOLD_COOLDOWN_MINUTES: int = 60
+    PORTFOLIO_REPORT_CHANNEL: str = "feishu"
+
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
 
@@ -1647,7 +1656,14 @@ class Config:
                 field_name='PORTFOLIO_RISK_LOOKBACK_DAYS',
                 minimum=1,
             ),
-            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true'
+            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true',
+            PORTFOLIO_TRIGGER_ENABLED=parse_env_bool(os.getenv("PORTFOLIO_TRIGGER_ENABLED"), True),
+            PORTFOLIO_WEEKLY_DAY=os.getenv("PORTFOLIO_WEEKLY_DAY", "monday"),
+            PORTFOLIO_WEEKLY_HOUR=parse_env_int(os.getenv("PORTFOLIO_WEEKLY_HOUR"), 9, field_name="PORTFOLIO_WEEKLY_HOUR", minimum=0, maximum=23),
+            PORTFOLIO_WEEKLY_MINUTE=parse_env_int(os.getenv("PORTFOLIO_WEEKLY_MINUTE"), 0, field_name="PORTFOLIO_WEEKLY_MINUTE", minimum=0, maximum=59),
+            PORTFOLIO_THRESHOLD_PCT=parse_env_float(os.getenv("PORTFOLIO_THRESHOLD_PCT"), 10.0, field_name="PORTFOLIO_THRESHOLD_PCT", minimum=1.0, maximum=50.0),
+            PORTFOLIO_THRESHOLD_COOLDOWN_MINUTES=parse_env_int(os.getenv("PORTFOLIO_THRESHOLD_COOLDOWN_MINUTES"), 60, field_name="PORTFOLIO_THRESHOLD_COOLDOWN_MINUTES", minimum=0, maximum=1440),
+            PORTFOLIO_REPORT_CHANNEL=os.getenv("PORTFOLIO_REPORT_CHANNEL", "feishu"),
         )
     
     @classmethod
