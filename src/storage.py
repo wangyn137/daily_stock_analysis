@@ -16,11 +16,10 @@ from contextlib import contextmanager
 import hashlib
 import json
 import logging
-import re
 import threading
 import time
-from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
+from datetime import datetime, date, timedelta, timezone
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union
 
 import pandas as pd
 from sqlalchemy import (
@@ -52,10 +51,13 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.config import get_config
+from src.utils.sniper_points import extract_sniper_points, parse_sniper_value
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -64,7 +66,29 @@ if TYPE_CHECKING:
     from src.search_service import SearchResponse
 
 
+def utc_naive_now() -> datetime:
+    """Return current UTC time without tzinfo for SQLite DateTime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def to_utc_naive_datetime(value: datetime) -> datetime:
+    """Normalize aware datetimes to UTC-naive; treat naive values as UTC-naive."""
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 # === 数据模型定义 ===
+
+class DatabaseSchemaMigration(Base):
+    """Applied database schema version marker."""
+
+    __tablename__ = 'schema_migrations'
+
+    version = Column(String(64), primary_key=True)
+    description = Column(String(255), nullable=False)
+    applied_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
 
 class StockDaily(Base):
     """
@@ -609,6 +633,46 @@ class ConversationMessage(Base):
     created_at = Column(DateTime, default=datetime.now, index=True)
 
 
+class ConversationSummary(Base):
+    """Rolling summary for visible Agent chat history."""
+
+    __tablename__ = 'conversation_summaries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), nullable=False, unique=True, index=True)
+    summary = Column(Text, nullable=False)
+    covered_message_id = Column(Integer, nullable=False, default=0)
+    source_message_count = Column(Integer, nullable=False, default=0)
+    estimated_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+
+class AgentProviderTurn(Base):
+    """Provider protocol trace required for thinking/tool-call roundtrip."""
+
+    __tablename__ = 'agent_provider_turns'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), nullable=False, index=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    provider = Column(String(64), nullable=False, index=True)
+    model = Column(String(160), nullable=False, index=True)
+    anchor_user_message_id = Column(Integer, nullable=False, index=True)
+    anchor_assistant_message_id = Column(Integer, nullable=False, index=True)
+    messages_json = Column(Text, nullable=False)
+    contains_reasoning = Column(Boolean, nullable=False, default=False)
+    contains_tool_calls = Column(Boolean, nullable=False, default=False)
+    contains_thinking_blocks = Column(Boolean, nullable=False, default=False)
+    must_roundtrip = Column(Boolean, nullable=False, default=False, index=True)
+    estimated_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_agent_provider_turn_bucket', 'session_id', 'provider', 'model', 'must_roundtrip'),
+    )
+
+
 class LLMUsage(Base):
     """One row per litellm.completion() call — token-usage audit log."""
 
@@ -722,6 +786,70 @@ class AlertCooldownRecord(Base):
     )
 
 
+class DecisionSignalRecord(Base):
+    """Persisted AI decision signal asset for Issue #1390 P1."""
+
+    __tablename__ = 'decision_signals'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    market = Column(String(8), nullable=False, index=True)
+    source_type = Column(String(32), nullable=False, index=True)
+    source_agent = Column(String(64))
+    source_report_id = Column(Integer, index=True)
+    trace_id = Column(String(64), index=True)
+    market_phase = Column(String(24), index=True)
+    trigger_source = Column(String(64), nullable=False, index=True)
+    action = Column(String(16), nullable=False, index=True)
+    action_label = Column(String(32))
+    confidence = Column(Float)
+    score = Column(Integer)
+    horizon = Column(String(16), index=True)
+    entry_low = Column(Float)
+    entry_high = Column(Float)
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    invalidation = Column(Text)
+    watch_conditions = Column(Text)
+    reason = Column(Text)
+    risk_summary = Column(Text)
+    catalyst_summary = Column(Text)
+    evidence_json = Column(Text)
+    data_quality_summary_json = Column(Text)
+    plan_quality = Column(String(16), nullable=False, default='unknown', index=True)
+    status = Column(String(16), nullable=False, default='active', index=True)
+    expires_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+    metadata_json = Column(Text)
+
+    __table_args__ = (
+        Index('ix_decision_signal_stock_status_time', 'stock_code', 'status', 'created_at'),
+        Index('ix_decision_signal_market_status_time', 'market', 'status', 'created_at'),
+        Index(
+            'ix_decision_signal_report_type_market_stock_action_horizon_phase',
+            'source_report_id',
+            'source_type',
+            'market',
+            'stock_code',
+            'action',
+            'horizon',
+            'market_phase',
+        ),
+        Index(
+            'ix_decision_signal_trace_type_market_stock_action_horizon_phase',
+            'trace_id',
+            'source_type',
+            'market',
+            'stock_code',
+            'action',
+            'horizon',
+            'market_phase',
+        ),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -802,6 +930,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
+            self._ensure_schema_migration_record()
 
             self._initialized = True
             logger.info(f"数据库初始化完成: {db_url}")
@@ -819,6 +948,32 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._SessionLocal = None
             self.__class__._instance = None
             raise
+
+    def _ensure_schema_migration_record(self) -> None:
+        session = self._SessionLocal()
+        values = {
+            "version": CURRENT_SCHEMA_VERSION,
+            "description": "Baseline schema created through SQLAlchemy metadata.create_all",
+        }
+        try:
+            if self._is_sqlite_engine:
+                statement = sqlite_insert(DatabaseSchemaMigration).values(**values)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                session.execute(statement)
+            else:
+                session.execute(DatabaseSchemaMigration.__table__.insert().values(**values))
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            with self._SessionLocal() as verify_session:
+                existing = verify_session.get(DatabaseSchemaMigration, CURRENT_SCHEMA_VERSION)
+            if existing is None:
+                raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
@@ -1305,7 +1460,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         save_snapshot: bool = True
     ) -> int:
         """
-        保存分析结果历史记录
+        保存分析结果历史记录。
+
+        Returns:
+            新保存的 AnalysisHistory.id；保存失败返回 0。
         """
         if result is None:
             return 0
@@ -1318,33 +1476,112 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         try:
             def _write(session: Session) -> int:
-                session.add(
-                    AnalysisHistory(
-                        query_id=query_id,
-                        code=result.code,
-                        name=result.name,
-                        report_type=report_type,
-                        sentiment_score=result.sentiment_score,
-                        operation_advice=result.operation_advice,
-                        trend_prediction=result.trend_prediction,
-                        analysis_summary=result.analysis_summary,
-                        raw_result=self._safe_json_dumps(raw_result),
-                        news_content=news_content,
-                        context_snapshot=context_text,
-                        ideal_buy=sniper_points.get("ideal_buy"),
-                        secondary_buy=sniper_points.get("secondary_buy"),
-                        stop_loss=sniper_points.get("stop_loss"),
-                        take_profit=sniper_points.get("take_profit"),
-                        created_at=datetime.now(),
-                    )
+                history = AnalysisHistory(
+                    query_id=query_id,
+                    code=result.code,
+                    name=result.name,
+                    report_type=report_type,
+                    sentiment_score=result.sentiment_score,
+                    operation_advice=result.operation_advice,
+                    trend_prediction=result.trend_prediction,
+                    analysis_summary=result.analysis_summary,
+                    raw_result=self._safe_json_dumps(raw_result),
+                    news_content=news_content,
+                    context_snapshot=context_text,
+                    ideal_buy=sniper_points.get("ideal_buy"),
+                    secondary_buy=sniper_points.get("secondary_buy"),
+                    stop_loss=sniper_points.get("stop_loss"),
+                    take_profit=sniper_points.get("take_profit"),
+                    created_at=datetime.now(),
                 )
-                return 1
+                session.add(history)
+                session.flush()
+                return int(history.id or 0)
             return self._run_write_transaction(
                 f"save_analysis_history[{result.code}]",
                 _write,
             )
         except Exception as e:
             logger.error(f"保存分析历史失败: {e}")
+            return 0
+
+    def update_analysis_history_diagnostics(
+        self,
+        *,
+        query_id: str,
+        code: Optional[str] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        notification_runs: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """
+        更新已保存分析历史的运行诊断快照。
+
+        通知结果通常在分析历史落库后才产生，因此这里仅补写
+        context_snapshot.diagnostics，不改变报告正文或其它历史字段。
+        """
+        if not query_id or (diagnostics is None and not notification_runs):
+            return 0
+
+        try:
+            def _write(session: Session) -> int:
+                conditions = [AnalysisHistory.query_id == query_id]
+                if code:
+                    conditions.append(AnalysisHistory.code == code)
+
+                row = session.execute(
+                    select(AnalysisHistory)
+                    .where(and_(*conditions))
+                    .order_by(desc(AnalysisHistory.created_at))
+                    .limit(1)
+                ).scalars().first()
+                if row is None:
+                    return 0
+
+                context_snapshot: Dict[str, Any] = {}
+                if row.context_snapshot:
+                    try:
+                        parsed = json.loads(row.context_snapshot)
+                        if isinstance(parsed, dict):
+                            context_snapshot = parsed
+                    except Exception:
+                        context_snapshot = {}
+
+                if diagnostics is not None:
+                    context_snapshot["diagnostics"] = diagnostics
+                else:
+                    existing_diagnostics = context_snapshot.get("diagnostics")
+                    if not isinstance(existing_diagnostics, dict):
+                        existing_diagnostics = {
+                            "query_id": query_id,
+                            "stock_code": code,
+                            "notification_runs": [],
+                        }
+                    runs = existing_diagnostics.get("notification_runs")
+                    if not isinstance(runs, list):
+                        runs = []
+                    trace_id = existing_diagnostics.get("trace_id")
+                    for run in notification_runs or []:
+                        if isinstance(run, dict):
+                            run_payload = dict(run)
+                            if trace_id and not run_payload.get("trace_id"):
+                                run_payload["trace_id"] = trace_id
+                            runs.append(run_payload)
+                    existing_diagnostics["notification_runs"] = runs
+                    context_snapshot["diagnostics"] = existing_diagnostics
+                row.context_snapshot = self._safe_json_dumps(context_snapshot)
+                return 1
+
+            return self._run_write_transaction(
+                f"update_analysis_history_diagnostics[{query_id}:{code or '*'}]",
+                _write,
+            )
+        except Exception as e:
+            logger.warning(
+                "更新分析历史诊断快照失败（fail-open）: query_id=%s code=%s err=%s",
+                query_id,
+                code,
+                e,
+            )
             return 0
 
     def get_analysis_history(
@@ -1388,10 +1625,39 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalars().all()
 
             return list(results)
+
+    def get_latest_analysis_history_id(
+        self,
+        *,
+        query_id: str,
+        code: str,
+        report_type: str,
+    ) -> Optional[int]:
+        """Return the latest matching history id for read-only lookups.
+
+        P2 automatic DecisionSignal extraction receives the freshly saved id
+        directly from ``save_analysis_history()`` and does not use this helper.
+        """
+
+        if not query_id or not code or not report_type:
+            return None
+
+        with self.get_session() as session:
+            return session.execute(
+                select(AnalysisHistory.id)
+                .where(
+                    AnalysisHistory.query_id == query_id,
+                    AnalysisHistory.code == code,
+                    AnalysisHistory.report_type == report_type,
+                )
+                .order_by(desc(AnalysisHistory.created_at), desc(AnalysisHistory.id))
+                .limit(1)
+            ).scalar_one_or_none()
     
     def get_analysis_history_paginated(
         self,
-        code: Optional[str] = None,
+        code: Optional[Union[str, List[str]]] = None,
+        report_type: Optional[str] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         offset: int = 0,
@@ -1402,6 +1668,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         
         Args:
             code: 股票代码筛选
+            report_type: 报告类型筛选
             start_date: 开始日期（含）
             end_date: 结束日期（含）
             offset: 偏移量（跳过前 N 条）
@@ -1416,7 +1683,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             conditions = []
             
             if code:
-                conditions.append(AnalysisHistory.code == code)
+                if isinstance(code, list):
+                    codes = [c for c in code if c]
+                    if codes:
+                        conditions.append(AnalysisHistory.code.in_(codes))
+                else:
+                    conditions.append(AnalysisHistory.code == code)
+            if report_type:
+                conditions.append(AnalysisHistory.report_type == report_type)
             if start_date:
                 # created_at >= start_date 00:00:00
                 conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
@@ -1466,7 +1740,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         """
         删除指定的分析历史记录。
 
-        同时清理依赖这些历史记录的回测结果，避免外键约束失败。
+        同时清理依赖这些历史记录的回测结果和分析来源决策信号，避免
+        依赖历史记录的派生数据残留。DecisionSignal 的 source_report_id
+        允许弱引用，因此这里只清理 source_type=analysis 的真实历史绑定信号。
 
         Args:
             record_ids: 要删除的历史记录主键 ID 列表
@@ -1479,15 +1755,100 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             return 0
 
         with self.session_scope() as session:
+            existing_ids = sorted(
+                session.execute(
+                    select(AnalysisHistory.id).where(AnalysisHistory.id.in_(ids))
+                ).scalars().all()
+            )
+            if not existing_ids:
+                return 0
+
             session.execute(
-                delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(ids))
+                delete(DecisionSignalRecord).where(
+                    and_(
+                        DecisionSignalRecord.source_type == "analysis",
+                        DecisionSignalRecord.source_report_id.in_(existing_ids),
+                    )
+                )
+            )
+            session.execute(
+                delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(existing_ids))
             )
             result = session.execute(
-                delete(AnalysisHistory).where(AnalysisHistory.id.in_(ids))
+                delete(AnalysisHistory).where(AnalysisHistory.id.in_(existing_ids))
             )
             return result.rowcount or 0
 
-    def get_latest_analysis_by_query_id(self, query_id: str) -> Optional[AnalysisHistory]:
+    def get_distinct_stocks_from_history(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: int = 200,
+        include_market_review: bool = False,
+    ) -> List[AnalysisHistory]:
+        """
+        获取历史记录中的不重复股票列表，每只股票取最新一条记录。
+
+        使用子查询按 code 分组取 MAX(id)，再 JOIN 回查完整记录。
+        默认排除大盘复盘，避免混入普通个股栏。
+
+        Args:
+            start_date: 开始日期
+            end_date: 结束日期
+            limit: 最大返回数量
+            include_market_review: 是否包含大盘复盘记录
+
+        Returns:
+            每条股票最新一条 AnalysisHistory 记录列表
+        """
+        with self.get_session() as session:
+            subq = (
+                select(
+                    AnalysisHistory.code,
+                    func.max(AnalysisHistory.id).label("max_id"),
+                )
+            )
+            if start_date:
+                subq = subq.where(
+                    AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time())
+                )
+            if end_date:
+                subq = subq.where(
+                    AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+                )
+            if not include_market_review:
+                subq = subq.where(
+                    and_(
+                        AnalysisHistory.code != "MARKET",
+                        or_(
+                            AnalysisHistory.report_type.is_(None),
+                            AnalysisHistory.report_type != "market_review",
+                        ),
+                    )
+                )
+            subq = subq.group_by(AnalysisHistory.code).subquery()
+
+            results = (
+                session.execute(
+                    select(AnalysisHistory)
+                    .join(subq, AnalysisHistory.id == subq.c.max_id)
+                    .order_by(
+                        desc(AnalysisHistory.created_at),
+                    )
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return list(results)
+
+    def get_latest_analysis_by_query_id(
+        self,
+        query_id: str,
+        *,
+        code: Optional[str] = None,
+        report_type: Optional[str] = None,
+    ) -> Optional[AnalysisHistory]:
         """
         根据 query_id 查询最新一条分析历史记录
 
@@ -1495,14 +1856,22 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         Args:
             query_id: 分析记录关联的 query_id
+            code: 可选股票代码过滤，用于区分同一 query_id 下的 MARKET 与个股记录
+            report_type: 可选报告类型过滤
 
         Returns:
             AnalysisHistory 对象，不存在返回 None
         """
         with self.get_session() as session:
+            conditions = [AnalysisHistory.query_id == query_id]
+            if code:
+                conditions.append(AnalysisHistory.code == code)
+            if report_type:
+                conditions.append(AnalysisHistory.report_type == report_type)
+
             result = session.execute(
                 select(AnalysisHistory)
-                .where(AnalysisHistory.query_id == query_id)
+                .where(and_(*conditions))
                 .order_by(desc(AnalysisHistory.created_at))
                 .limit(1)
             ).scalars().first()
@@ -1839,146 +2208,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
     @staticmethod
     def _parse_sniper_value(value: Any) -> Optional[float]:
-        """
-        Parse a sniper point value from various formats to float.
-
-        Handles: numeric types, plain number strings, Chinese price formats
-        like "18.50元", range formats like "18.50-19.00", and text with
-        embedded numbers while filtering out MA indicators.
-        """
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            v = float(value)
-            return v if v > 0 else None
-
-        text = str(value).replace(',', '').replace('，', '').strip()
-        if not text or text == '-' or text == '—' or text == 'N/A':
-            return None
-
-        # 尝试直接解析纯数字字符串
-        try:
-            return float(text)
-        except ValueError:
-            pass
-
-        # 优先截取 "：" 到 "元" 之间的价格，避免误提取 MA5/MA10 等技术指标数字
-        colon_pos = max(text.rfind("："), text.rfind(":"))
-        yuan_pos = text.find("元", colon_pos + 1 if colon_pos != -1 else 0)
-        if yuan_pos != -1:
-            segment_start = colon_pos + 1 if colon_pos != -1 else 0
-            segment = text[segment_start:yuan_pos]
-            
-            # 使用 finditer 并过滤掉 MA 开头的数字
-            matches = list(re.finditer(r"-?\d+(?:\.\d+)?", segment))
-            valid_numbers = []
-            for m in matches:
-                # 检查前面是否是 "MA" (忽略大小写)
-                start_idx = m.start()
-                if start_idx >= 2:
-                    prefix = segment[start_idx-2:start_idx].upper()
-                    if prefix == "MA":
-                        continue
-                valid_numbers.append(m.group())
-            
-            if valid_numbers:
-                try:
-                    return abs(float(valid_numbers[-1]))
-                except ValueError:
-                    pass
-
-        # 兜底：无"元"字时，先截去第一个括号后的内容，避免误提取括号内技术指标数字
-        # 例如 "1.52-1.53 (回踩MA5/10附近)" → 仅在 "1.52-1.53 " 中搜索
-        paren_pos = len(text)
-        for paren_char in ('(', '（'):
-            pos = text.find(paren_char)
-            if pos != -1:
-                paren_pos = min(paren_pos, pos)
-        search_text = text[:paren_pos].strip() or text  # 括号前为空时降级用全文
-
-        valid_numbers = []
-        for m in re.finditer(r"\d+(?:\.\d+)?", search_text):
-            start_idx = m.start()
-            if start_idx >= 2 and search_text[start_idx-2:start_idx].upper() == "MA":
-                continue
-            valid_numbers.append(m.group())
-        if valid_numbers:
-            try:
-                return float(valid_numbers[-1])
-            except ValueError:
-                pass
-        return None
+        return parse_sniper_value(value)
 
     def _extract_sniper_points(self, result: Any) -> Dict[str, Optional[float]]:
-        """
-        Extract sniper point values from an AnalysisResult.
+        """Extract normalized sniper point values from an AnalysisResult."""
 
-        Tries multiple extraction paths to handle different dashboard structures:
-        1. result.get_sniper_points() (standard path)
-        2. Direct dashboard dict traversal with various nesting levels
-        3. Fallback from raw_result dict if available
-        """
-        raw_points = {}
-
-        # Path 1: standard method
-        if hasattr(result, "get_sniper_points"):
-            raw_points = result.get_sniper_points() or {}
-
-        # Path 2: direct dashboard traversal when standard path yields empty values
-        if not any(raw_points.get(k) for k in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")):
-            dashboard = getattr(result, "dashboard", None)
-            if isinstance(dashboard, dict):
-                raw_points = self._find_sniper_in_dashboard(dashboard) or raw_points
-
-        # Path 3: try raw_result for agent mode results
-        if not any(raw_points.get(k) for k in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")):
-            raw_response = getattr(result, "raw_response", None)
-            if isinstance(raw_response, dict):
-                raw_points = self._find_sniper_in_dashboard(raw_response) or raw_points
-
-        return {
-            "ideal_buy": self._parse_sniper_value(raw_points.get("ideal_buy")),
-            "secondary_buy": self._parse_sniper_value(raw_points.get("secondary_buy")),
-            "stop_loss": self._parse_sniper_value(raw_points.get("stop_loss")),
-            "take_profit": self._parse_sniper_value(raw_points.get("take_profit")),
-        }
-
-    @staticmethod
-    def _find_sniper_in_dashboard(d: dict) -> Optional[Dict[str, Any]]:
-        """
-        Recursively search for sniper_points in a dashboard dict.
-        Handles various nesting: dashboard.battle_plan.sniper_points,
-        dashboard.dashboard.battle_plan.sniper_points, etc.
-        """
-        if not isinstance(d, dict):
-            return None
-
-        # Direct: d has sniper_points keys at top level
-        if "ideal_buy" in d:
-            return d
-
-        # d.sniper_points
-        sp = d.get("sniper_points")
-        if isinstance(sp, dict) and sp:
-            return sp
-
-        # d.battle_plan.sniper_points
-        bp = d.get("battle_plan")
-        if isinstance(bp, dict):
-            sp = bp.get("sniper_points")
-            if isinstance(sp, dict) and sp:
-                return sp
-
-        # d.dashboard.battle_plan.sniper_points (double-nested)
-        inner = d.get("dashboard")
-        if isinstance(inner, dict):
-            bp = inner.get("battle_plan")
-            if isinstance(bp, dict):
-                sp = bp.get("sniper_points")
-                if isinstance(sp, dict) and sp:
-                    return sp
-
-        return None
+        return extract_sniper_points(result)
 
     @staticmethod
     def _build_fallback_url_key(
@@ -1995,7 +2230,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
         return f"no-url:{code}:{digest}"
 
-    def save_conversation_message(self, session_id: str, role: str, content: str) -> None:
+    def save_conversation_message(self, session_id: str, role: str, content: str) -> int:
         """
         保存 Agent 对话消息
         """
@@ -2006,6 +2241,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 content=content
             )
             session.add(msg)
+            session.flush()
+            return int(msg.id)
 
     def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -2019,6 +2256,215 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 倒序返回，保证时间顺序
             return [{"role": msg.role, "content": msg.content} for msg in reversed(messages)]
+
+    def get_visible_conversation_messages(self, session_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return visible user/assistant conversation messages in chronological order."""
+        with self.session_scope() as session:
+            stmt = (
+                select(ConversationMessage)
+                .where(
+                    and_(
+                        ConversationMessage.session_id == session_id,
+                        ConversationMessage.role.in_(["user", "assistant"]),
+                    )
+                )
+                .order_by(ConversationMessage.created_at, ConversationMessage.id)
+            )
+            if limit is not None:
+                stmt = (
+                    stmt.order_by(None)
+                    .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+                    .limit(limit)
+                )
+            messages = session.execute(stmt).scalars().all()
+            if limit is not None:
+                messages = list(reversed(messages))
+            return [
+                {
+                    "id": msg.id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "created_at": msg.created_at,
+                }
+                for msg in messages
+                if msg.content
+            ]
+
+    def get_conversation_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the rolling summary for a conversation session, if present."""
+        with self.session_scope() as session:
+            stmt = select(ConversationSummary).where(
+                ConversationSummary.session_id == session_id
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "session_id": row.session_id,
+                "summary": row.summary,
+                "covered_message_id": row.covered_message_id,
+                "source_message_count": row.source_message_count,
+                "estimated_tokens": row.estimated_tokens,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+
+    def save_agent_provider_turn(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        provider: str,
+        model: str,
+        anchor_user_message_id: int,
+        anchor_assistant_message_id: int,
+        messages: List[Dict[str, Any]],
+        contains_reasoning: bool,
+        contains_tool_calls: bool,
+        contains_thinking_blocks: bool,
+        must_roundtrip: bool,
+        estimated_tokens: int,
+    ) -> int:
+        """Persist one provider protocol trace and enforce per-model retention."""
+        with self.session_scope() as session:
+            row = AgentProviderTurn(
+                session_id=session_id,
+                run_id=run_id,
+                provider=provider,
+                model=model,
+                anchor_user_message_id=int(anchor_user_message_id or 0),
+                anchor_assistant_message_id=int(anchor_assistant_message_id or 0),
+                messages_json=json.dumps(messages or [], ensure_ascii=False, default=str),
+                contains_reasoning=bool(contains_reasoning),
+                contains_tool_calls=bool(contains_tool_calls),
+                contains_thinking_blocks=bool(contains_thinking_blocks),
+                must_roundtrip=bool(must_roundtrip),
+                estimated_tokens=int(estimated_tokens or 0),
+            )
+            session.add(row)
+            session.flush()
+            row_id = int(row.id)
+            if row.must_roundtrip:
+                self._trim_agent_provider_turns(
+                    session=session,
+                    session_id=session_id,
+                    provider=provider,
+                    model=model,
+                    keep=PROVIDER_TRACE_RETENTION_LIMIT,
+                )
+            return row_id
+
+    def get_agent_provider_turns(
+        self,
+        session_id: str,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        must_roundtrip_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return provider trace turns in chronological order."""
+        with self.session_scope() as session:
+            conditions = [AgentProviderTurn.session_id == session_id]
+            if provider:
+                conditions.append(AgentProviderTurn.provider == provider)
+            if model:
+                conditions.append(AgentProviderTurn.model == model)
+            if must_roundtrip_only:
+                conditions.append(AgentProviderTurn.must_roundtrip.is_(True))
+            stmt = (
+                select(AgentProviderTurn)
+                .where(and_(*conditions))
+                .order_by(AgentProviderTurn.created_at, AgentProviderTurn.id)
+            )
+            rows = session.execute(stmt).scalars().all()
+            result = []
+            for row in rows:
+                try:
+                    messages = json.loads(row.messages_json or "[]")
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "Invalid provider trace messages_json skipped for session %s turn %s: %s",
+                        row.session_id,
+                        row.id,
+                        exc,
+                    )
+                    messages = []
+                result.append({
+                    "id": row.id,
+                    "session_id": row.session_id,
+                    "run_id": row.run_id,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "anchor_user_message_id": row.anchor_user_message_id,
+                    "anchor_assistant_message_id": row.anchor_assistant_message_id,
+                    "messages": messages if isinstance(messages, list) else [],
+                    "messages_json": row.messages_json,
+                    "contains_reasoning": row.contains_reasoning,
+                    "contains_tool_calls": row.contains_tool_calls,
+                    "contains_thinking_blocks": row.contains_thinking_blocks,
+                    "must_roundtrip": row.must_roundtrip,
+                    "estimated_tokens": row.estimated_tokens,
+                    "created_at": row.created_at,
+                })
+            return result
+
+    def _trim_agent_provider_turns(
+        self,
+        *,
+        session: Session,
+        session_id: str,
+        provider: str,
+        model: str,
+        keep: int,
+    ) -> int:
+        old_ids_stmt = (
+            select(AgentProviderTurn.id)
+            .where(
+                and_(
+                    AgentProviderTurn.session_id == session_id,
+                    AgentProviderTurn.provider == provider,
+                    AgentProviderTurn.model == model,
+                    AgentProviderTurn.must_roundtrip.is_(True),
+                )
+            )
+            .order_by(AgentProviderTurn.created_at.desc(), AgentProviderTurn.id.desc())
+            .offset(max(0, int(keep)))
+        )
+        old_ids = list(session.execute(old_ids_stmt).scalars().all())
+        if not old_ids:
+            return 0
+        result = session.execute(
+            delete(AgentProviderTurn).where(AgentProviderTurn.id.in_(old_ids))
+        )
+        return int(result.rowcount or 0)
+
+    def upsert_conversation_summary(
+        self,
+        session_id: str,
+        summary: str,
+        covered_message_id: int,
+        source_message_count: int,
+        estimated_tokens: int,
+    ) -> None:
+        """Create or update the rolling summary for a conversation session."""
+        with self.session_scope() as session:
+            now = datetime.now()
+            values = {
+                "session_id": session_id,
+                "summary": summary,
+                "covered_message_id": int(covered_message_id or 0),
+                "source_message_count": int(source_message_count or 0),
+                "estimated_tokens": int(estimated_tokens or 0),
+                "updated_at": now,
+            }
+            stmt = sqlite_insert(ConversationSummary).values(**values)
+            session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["session_id"],
+                    set_=values,
+                )
+            )
 
     def conversation_session_exists(self, session_id: str) -> bool:
         """Return True when at least one message exists for the given session."""
@@ -2138,6 +2584,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             删除的消息数
         """
         with self.session_scope() as session:
+            session.execute(
+                delete(AgentProviderTurn).where(
+                    AgentProviderTurn.session_id == session_id
+                )
+            )
+            session.execute(
+                delete(ConversationSummary).where(
+                    ConversationSummary.session_id == session_id
+                )
+            )
             result = session.execute(
                 delete(ConversationMessage).where(
                     ConversationMessage.session_id == session_id

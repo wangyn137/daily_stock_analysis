@@ -1,8 +1,42 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import type { ReactNode } from 'react';
+import { UiLanguageProvider, useUiLanguage } from '../../../contexts/UiLanguageContext';
+import { UI_LANGUAGE_STORAGE_KEY } from '../../../utils/uiLanguage';
 import { SettingsField } from '../SettingsField';
 
 describe('SettingsField', () => {
+  it('prefers localized Chinese field titles over backend schema titles', () => {
+    render(
+      <SettingsField
+        item={{
+          key: 'STOCK_LIST',
+          value: '600519',
+          rawValueExists: true,
+          isMasked: false,
+          schema: {
+            key: 'STOCK_LIST',
+            title: 'Stock List',
+            category: 'base',
+            dataType: 'string',
+            uiControl: 'text',
+            isSensitive: false,
+            isRequired: false,
+            isEditable: true,
+            options: [],
+            validation: {},
+            displayOrder: 1,
+          },
+        }}
+        value="600519"
+        onChange={vi.fn()}
+      />
+    );
+
+    expect(screen.getByLabelText('自选股列表')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Stock List')).not.toBeInTheDocument();
+  });
+
   it('renders sensitive field metadata and validation errors', () => {
     const onChange = vi.fn();
 
@@ -118,13 +152,178 @@ describe('SettingsField', () => {
       />
     );
 
-    const select = screen.getByLabelText('NOTIFICATION_MIN_SEVERITY');
-    expect(screen.getByRole('option', { name: 'Not set' })).not.toBeDisabled();
+    const select = screen.getByLabelText('最小通知级别');
+    expect(screen.getByRole('option', { name: '未设置' })).not.toBeDisabled();
     expect(screen.queryByRole('option', { name: '请选择' })).not.toBeInTheDocument();
 
     fireEvent.change(select, { target: { value: '' } });
 
     expect(onChange).toHaveBeenCalledWith('NOTIFICATION_MIN_SEVERITY', '');
+  });
+
+  it('renders localized labels for real system config select options', () => {
+    const selectCases = [
+      {
+        key: 'NEWS_STRATEGY_PROFILE',
+        category: 'data_source',
+        options: ['ultra_short', 'short', 'medium', 'long'],
+        expectedLabels: ['超短线（1天）', '短期（3天）', '中期（7天）', '长期（30天）'],
+      },
+      {
+        key: 'REPORT_TYPE',
+        category: 'notification',
+        options: ['simple', 'full', 'brief'],
+        expectedLabels: ['简洁', '完整', '简报'],
+      },
+      {
+        key: 'LOG_LEVEL',
+        category: 'system',
+        options: ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        expectedLabels: ['调试', '信息', '警告', '错误', '严重'],
+      },
+      {
+        key: 'MARKET_REVIEW_REGION',
+        category: 'system',
+        options: ['cn', 'hk', 'us', 'both'],
+        expectedLabels: ['A 股', '港股', '美股', '全部市场'],
+      },
+    ] as const;
+
+    selectCases.forEach(({ key, category, options, expectedLabels }) => {
+      const { unmount } = render(
+        <SettingsField
+          item={{
+            key,
+            value: options[0],
+            rawValueExists: true,
+            isMasked: false,
+            schema: {
+              key,
+              title: key,
+              category,
+              dataType: 'string',
+              uiControl: 'select',
+              isSensitive: false,
+              isRequired: false,
+              isEditable: true,
+              options: [...options],
+              validation: {},
+              displayOrder: 1,
+            },
+          }}
+          value={options[0]}
+          onChange={() => undefined}
+        />
+      );
+
+      expectedLabels.forEach((label) => {
+        expect(screen.getByRole('option', { name: label })).toBeInTheDocument();
+      });
+
+      options.forEach((rawOption) => {
+        expect(screen.queryByRole('option', { name: rawOption })).not.toBeInTheDocument();
+      });
+
+      unmount();
+    });
+  });
+
+  it('renders context compression profile options with Chinese labels', () => {
+    const onChange = vi.fn();
+
+    render(
+      <SettingsField
+        item={{
+          key: 'AGENT_CONTEXT_COMPRESSION_PROFILE',
+          value: 'balanced',
+          rawValueExists: true,
+          isMasked: false,
+          schema: {
+            key: 'AGENT_CONTEXT_COMPRESSION_PROFILE',
+            category: 'agent',
+            dataType: 'string',
+            uiControl: 'select',
+            isSensitive: false,
+            isRequired: false,
+            isEditable: true,
+            options: [
+              { label: '成本优先', value: 'cost' },
+              { label: '均衡推荐', value: 'balanced' },
+              { label: '长上下文原文优先', value: 'long_context_raw_first' },
+            ],
+            validation: {
+              enum: ['cost', 'balanced', 'long_context_raw_first'],
+            },
+            displayOrder: 72,
+          },
+        }}
+        value="balanced"
+        onChange={onChange}
+      />
+    );
+
+    expect(screen.getByLabelText('上下文压缩策略')).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '成本优先' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '均衡推荐' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '长上下文原文优先' })).toBeInTheDocument();
+  });
+
+  it('renders blank-value preset guidance for context compression numeric fields', () => {
+    const onChange = vi.fn();
+
+    render(
+      <>
+        <SettingsField
+          item={{
+            key: 'AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS',
+            value: '',
+            rawValueExists: false,
+            isMasked: false,
+            schema: {
+              key: 'AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS',
+              category: 'agent',
+              dataType: 'integer',
+              uiControl: 'number',
+              isSensitive: false,
+              isRequired: false,
+              isEditable: true,
+              options: [],
+              validation: { min: 1000 },
+              displayOrder: 73,
+            },
+          }}
+          value=""
+          onChange={onChange}
+        />
+        <SettingsField
+          item={{
+            key: 'AGENT_CONTEXT_PROTECTED_TURNS',
+            value: '',
+            rawValueExists: false,
+            isMasked: false,
+            schema: {
+              key: 'AGENT_CONTEXT_PROTECTED_TURNS',
+              category: 'agent',
+              dataType: 'integer',
+              uiControl: 'number',
+              isSensitive: false,
+              isRequired: false,
+              isEditable: true,
+              options: [],
+              validation: { min: 1 },
+              displayOrder: 74,
+            },
+          }}
+          value=""
+          onChange={onChange}
+        />
+      </>
+    );
+
+    expect(screen.getByLabelText('压缩触发阈值（tokens）')).toBeInTheDocument();
+    expect(screen.getByLabelText('原文保护轮次')).toBeInTheDocument();
+    expect(screen.getByText(/估算历史 token 超过该值时触发摘要/)).toHaveTextContent('留空则跟随当前上下文压缩策略 profile 默认值');
+    expect(screen.getByText(/压缩时最近 N 个用户轮次及其后的回复保持原文/)).toHaveTextContent('留空则跟随当前上下文压缩策略 profile 默认值');
   });
 
   it('renders localized custom webhook body template guidance', () => {
@@ -216,5 +415,92 @@ describe('SettingsField', () => {
 
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('dialog', { name: '自选股列表' })).not.toBeInTheDocument();
+  });
+
+  it('uses per-field schema titles even when helpKey is shared by multiple fields', () => {
+    const restoreLanguage = localStorage.getItem(UI_LANGUAGE_STORAGE_KEY);
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
+
+    try {
+      const SchemaTitleSwitcher = ({ children }: { children: ReactNode }) => {
+        const { setLanguage } = useUiLanguage();
+        return (
+          <div>
+            <button type="button" onClick={() => setLanguage('en')}>
+              switch-en
+            </button>
+            {children}
+          </div>
+        );
+      };
+
+      render(
+        <UiLanguageProvider>
+          <SchemaTitleSwitcher>
+            <SettingsField
+              item={{
+                key: 'OPENAI_MODEL',
+                value: 'gemini/gemini-3.1-pro-preview',
+                rawValueExists: true,
+                isMasked: false,
+                schema: {
+                  key: 'OPENAI_MODEL',
+                  category: 'ai_model',
+                  dataType: 'string',
+                  uiControl: 'text',
+                  isSensitive: false,
+                  isRequired: false,
+                  isEditable: true,
+                  options: [],
+                  validation: {},
+                  displayOrder: 10,
+                  title: 'Primary model',
+                  helpKey: 'settings.llm_channel.primary_model',
+                  description: 'Primary model description',
+                },
+              }}
+              value="gemini/gemini-3.1-pro-preview"
+              onChange={vi.fn()}
+            />
+            <SettingsField
+              item={{
+                key: 'OPENAI_VISION_MODEL',
+                value: 'gemini/gemini-2.0-flash',
+                rawValueExists: true,
+                isMasked: false,
+                schema: {
+                  key: 'OPENAI_VISION_MODEL',
+                  category: 'ai_model',
+                  dataType: 'string',
+                  uiControl: 'text',
+                  isSensitive: false,
+                  isRequired: false,
+                  isEditable: true,
+                  options: [],
+                  validation: {},
+                  displayOrder: 11,
+                  title: 'Vision model',
+                  helpKey: 'settings.llm_channel.primary_model',
+                  description: 'Vision model description',
+                },
+              }}
+              value="gemini/gemini-2.0-flash"
+              onChange={vi.fn()}
+            />
+          </SchemaTitleSwitcher>
+        </UiLanguageProvider>
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'switch-en' }));
+
+      expect(screen.getByLabelText('Primary model')).toBeInTheDocument();
+      expect(screen.getByLabelText('Vision model')).toBeInTheDocument();
+    } finally {
+      if (restoreLanguage) {
+        localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, restoreLanguage);
+      } else {
+        localStorage.removeItem(UI_LANGUAGE_STORAGE_KEY);
+      }
+    }
   });
 });

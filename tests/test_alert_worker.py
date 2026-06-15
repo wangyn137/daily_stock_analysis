@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -254,6 +255,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         return SimpleNamespace(
             agent_event_monitor_enabled=True,
             agent_event_alert_rules_json=raw_rules,
+            trading_day_check_enabled=False,
         )
 
     def _create_rule(self, **overrides) -> dict:
@@ -312,6 +314,43 @@ class AlertWorkerTestCase(unittest.TestCase):
         else:
             notifier.send_with_results.side_effect = list(results)
         return notifier
+
+    def test_triggered_diagnostics_merge_visibility_and_market_scope_uses_region(self) -> None:
+        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service)
+        runtime_rule = SimpleNamespace(
+            target_scope="market",
+            target="cn",
+            effective_target="cn",
+        )
+        result = {
+            "status": "triggered",
+            "diagnostics": '{"existing":"keep"}',
+        }
+
+        with patch(
+            "src.services.alert_worker.build_market_phase_context",
+            return_value={
+                "phase": "intraday",
+                "market": "cn",
+                "trigger_source": "alert",
+                "is_trading_day": True,
+                "is_partial_bar": True,
+            },
+        ) as build_context, patch(
+            "src.services.alert_worker.get_market_for_stock",
+            side_effect=AssertionError("market scope must not infer stock market"),
+        ):
+            diagnostics = worker._diagnostics_for_status("triggered", result, runtime_rule)
+
+        payload = json.loads(diagnostics)
+        self.assertEqual(payload["existing"], "keep")
+        visibility = payload["analysis_visibility"]
+        self.assertEqual(visibility["source"], "alert_trigger_market_context")
+        self.assertEqual(visibility["market_phase_summary"]["phase"], "intraday")
+        self.assertEqual(visibility["market_phase_summary"]["market"], "cn")
+        self.assertTrue(visibility["market_phase_summary"]["is_partial_bar"])
+        build_context.assert_called_once()
+        self.assertEqual(build_context.call_args.kwargs["market"], "cn")
 
     def test_enabled_db_rule_triggers_and_disabled_rule_is_ignored(self) -> None:
         enabled_rule = self._create_rule(target="600519")
@@ -995,6 +1034,77 @@ class AlertWorkerTestCase(unittest.TestCase):
         self.assertEqual(stats["evaluated"], 0)
         self.assertEqual(self._triggers(), [])
 
+    def test_market_light_rule_triggers_with_market_payload_and_deduplicates_trade_date(self) -> None:
+        rule = self._create_rule(
+            name="Market risk-off",
+            target_scope="market",
+            target="cn",
+            alert_type="market_light_status",
+            parameters={"statuses": ["red", "yellow"]},
+        )
+        snapshot = {
+            "region": "cn",
+            "trade_date": "2026-03-07",
+            "status": "red",
+            "score": 35,
+            "label": "偏防守",
+            "temperature_label": "偏弱",
+            "reasons": ["test"],
+            "guidance": "test",
+            "dimensions": {
+                "breadth": {"score": 20, "available": True},
+                "index": {"score": 30, "available": True},
+                "limit": {"score": 10, "available": True},
+            },
+            "data_quality": "ok",
+        }
+        notifier = self._notifier()
+        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
+
+        with patch("src.services.market_light_alerts.build_current_snapshot", return_value=snapshot):
+            first = worker.run_once()
+            second = worker.run_once()
+
+        self.assertEqual(first["triggered"], 1)
+        self.assertEqual(first["recorded"], 1)
+        self.assertEqual(second["triggered"], 1)
+        self.assertEqual(second["recorded"], 0)
+        notifier.send_with_results.assert_called_once()
+        self.assertEqual(notifier.send_with_results.call_args.kwargs["route_type"], "alert")
+        triggers = self._triggers(rule_id=rule["id"], status="triggered")
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0]["target"], "cn")
+        self.assertEqual(triggers[0]["observed_value"], 35.0)
+        self.assertEqual(triggers[0]["data_source"], "market_light")
+        self.assertEqual(triggers[0]["data_timestamp"], "2026-03-07T00:00:00")
+
+    def test_market_light_rule_skips_non_trading_day_when_check_enabled(self) -> None:
+        self._create_rule(
+            name="Market risk-off",
+            target_scope="market",
+            target="cn",
+            alert_type="market_light_status",
+            parameters={"statuses": ["red"]},
+        )
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json="",
+            trading_day_check_enabled=True,
+        )
+        worker = AlertWorker(config_provider=lambda: config, service=self.service)
+
+        with patch("src.services.market_light_alerts.get_open_markets_today", return_value=set()), patch(
+            "src.services.market_light_alerts.build_current_snapshot"
+        ) as build_snapshot:
+            stats = worker.run_once()
+
+        self.assertEqual(stats["skipped"], 1)
+        build_snapshot.assert_not_called()
+        triggers = self._triggers(status="skipped")
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0]["target"], "cn")
+        self.assertEqual(triggers[0]["data_source"], "market_light")
+
     def test_single_rule_failure_does_not_block_other_rules(self) -> None:
         self._create_rule(target="600519")
         self._create_rule(
@@ -1364,6 +1474,143 @@ class AlertWorkerTestCase(unittest.TestCase):
         self.assertEqual(fourth["notified"], 0)
         self.assertEqual(notifier.send_with_results.call_count, 3)
         self.assertEqual(len(self._triggers(status="triggered")), 4)
+
+    def test_p6_watchlist_expands_to_child_keys_for_db_cooldown_fallback(self) -> None:
+        self._create_rule(
+            name="Watchlist",
+            target_scope="watchlist",
+            target="default",
+            alert_type="price_cross",
+            parameters={"direction": "above", "price": 10},
+            cooldown_policy={"cooldown_seconds": 60},
+        )
+        notifier = self._notifier()
+        config = self._config()
+        config.stock_list = ["600519", "000001"]
+        now = {"value": 1000.0}
+
+        async def _quote(_monitor, _stock_code):
+            return SimpleNamespace(price=11.0)
+
+        worker = AlertWorker(
+            config_provider=lambda: config,
+            service=self.service,
+            notifier=notifier,
+            now_provider=lambda: now["value"],
+            fingerprint_ttl_seconds=86400,
+        )
+        with patch.object(
+            self.service.repo,
+            "get_active_cooldown",
+            side_effect=RuntimeError("database locked"),
+        ), patch("src.agent.events.EventMonitor._get_realtime_quote", new=_quote):
+            first = worker.run_once()
+            now["value"] += 10
+            second = worker.run_once()
+
+        self.assertEqual(first["loaded"], 2)
+        self.assertEqual(first["notified"], 2)
+        self.assertEqual(second["cooldown_suppressed"], 2)
+        self.assertEqual(notifier.send_with_results.call_count, 2)
+        targets = {item["target"] for item in self._triggers(status="triggered")}
+        self.assertEqual(targets, {"600519", "000001"})
+
+    def test_p6_empty_watchlist_writes_skipped_trigger(self) -> None:
+        self._create_rule(
+            name="Watchlist",
+            target_scope="watchlist",
+            target="default",
+            alert_type="price_cross",
+            parameters={"direction": "above", "price": 10},
+        )
+        config = self._config()
+        config.stock_list = []
+        worker = AlertWorker(config_provider=lambda: config, service=self.service, notifier=self._notifier())
+
+        stats = worker.run_once()
+
+        self.assertEqual(stats["skipped"], 1)
+        triggers = self._triggers(status="skipped")
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0]["target"], "watchlist:default")
+        self.assertIn("No watchlist targets", triggers[0]["diagnostics"])
+
+    def test_p6_overflow_payload_is_dry_run_only_and_worker_does_not_write_degraded_history(self) -> None:
+        rule = self._create_rule(
+            name="Large watchlist",
+            target_scope="watchlist",
+            target="default",
+            alert_type="price_cross",
+            parameters={"direction": "above", "price": 10},
+        )
+        row = self.service.repo.get_rule(rule["id"])
+        config = self._config()
+        config.stock_list = [f"{index:06d}" for index in range(1, 102)]
+
+        dry_run_payloads = self.service.build_runtime_payloads(row, config=config)
+        worker_payloads = self.service.build_runtime_payloads(row, config=config, include_overflow_payload=False)
+
+        self.assertEqual(len(dry_run_payloads), 101)
+        self.assertTrue(dry_run_payloads[-1].effective_target.endswith(":overflow"))
+        self.assertEqual(len(worker_payloads), 100)
+        self.assertFalse(any(payload.effective_target.endswith(":overflow") for payload in worker_payloads))
+
+        async def _not_triggered(rule_obj, *_args, **_kwargs):
+            return {
+                "rule_id": self.service._runtime_rule_id(rule_obj),
+                "status": "not_triggered",
+                "record_status": None,
+                "triggered": False,
+                "observed_value": 9.0,
+                "threshold": 10.0,
+                "data_source": "realtime_quote",
+                "data_timestamp": None,
+                "reason": "below threshold",
+                "message": "below threshold",
+            }
+
+        worker = AlertWorker(config_provider=lambda: config, service=self.service, notifier=self._notifier())
+        with patch.object(self.service, "_evaluate_rule", new=_not_triggered):
+            stats = worker.run_once()
+
+        self.assertEqual(stats["loaded"], 100)
+        self.assertEqual(stats["degraded"], 0)
+        self.assertEqual(self._triggers(status="degraded"), [])
+
+    def test_p6_portfolio_account_risk_uses_account_effective_target_and_diagnostics(self) -> None:
+        rule = self._create_rule(
+            name="Portfolio risk",
+            target_scope="portfolio_account",
+            target="all",
+            alert_type="portfolio_concentration",
+            parameters={},
+        )
+        notifier = self._notifier()
+
+        async def _evaluate_portfolio(rule_obj, *_args, **_kwargs):
+            return {
+                "rule_id": self.service._runtime_rule_id(rule_obj),
+                "status": "triggered",
+                "record_status": "triggered",
+                "triggered": True,
+                "observed_value": 42.0,
+                "threshold": 35.0,
+                "data_source": "portfolio_risk",
+                "data_timestamp": None,
+                "reason": "account all concentration top weight 42.00%",
+                "message": "account all concentration top weight 42.00%",
+                "diagnostics": '{"account_id":"all","currency":"CNY","as_of":"2026-05-20"}',
+            }
+
+        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
+        with patch.object(self.service, "_evaluate_rule", new=_evaluate_portfolio):
+            stats = worker.run_once()
+
+        self.assertEqual(stats["triggered"], 1)
+        triggers = self._triggers(rule_id=rule["id"], status="triggered")
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0]["target"], "account:all")
+        self.assertIn("account_id", triggers[0]["diagnostics"])
 
 
 if __name__ == "__main__":

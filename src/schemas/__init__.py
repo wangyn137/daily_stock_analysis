@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-Report Engine Schemas
+DSA Schemas
 ===================================
 
-Pydantic schemas for LLM report output validation.
+Pydantic schemas for report output validation and internal contracts.
 """
 
+from src.schemas.analysis_context_pack import (
+    PACK_VERSION,
+    AnalysisContextBlock,
+    AnalysisContextItem,
+    AnalysisContextPack,
+    AnalysisSubject,
+    ContextFieldStatus,
+    DataQuality,
+)
 from src.schemas.position_schemas import (
     CycleAnalysisResult,
     Position,
@@ -17,6 +26,13 @@ from src.schemas.report_schema import AnalysisReportSchema
 
 __all__ = [
     "AnalysisReportSchema",
+    "PACK_VERSION",
+    "AnalysisContextBlock",
+    "AnalysisContextItem",
+    "AnalysisContextPack",
+    "AnalysisSubject",
+    "ContextFieldStatus",
+    "DataQuality",
     "CycleAnalysisResult",
     "Position",
     "PositionAnalysisReport",
