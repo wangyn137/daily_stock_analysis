@@ -566,7 +566,45 @@ class StockAnalysisPipeline:
             )
             if portfolio_context is not None:
                 enhanced_context["portfolio_context"] = dict(portfolio_context)
-            
+
+            # North-bound & theme context (lightweight HTTP APIs, safe to fail)
+            try:
+                from src.services.northbound_service import NorthboundService
+                nb = NorthboundService()
+                enhanced_context["northbound_context"] = nb.get_context_summary(days=5)
+            except Exception:
+                pass
+            try:
+                from src.services.theme_attribution_service import ThemeAttributionService
+                portfolio_codes = (
+                    [c for c in self.config.stock_list]
+                    if getattr(self.config, "stock_list", None) else None
+                )
+                ts = ThemeAttributionService()
+                enhanced_context["theme_context"] = ts.get_context_summary(
+                    portfolio_codes=portfolio_codes,
+                )
+                # Also inject into individual stock analysis: check if THIS stock is hot
+                code_match = ts.match_portfolio([code])
+                if code_match.get(code):
+                    enhanced_context["theme_match"] = code_match[code]
+            except Exception:
+                pass
+            # Research reports & consensus EPS (eastmoney + THS, with rate limiting)
+            try:
+                from src.services.research_service import get_research_context
+                price = (
+                    getattr(realtime_quote, 'price', None)
+                    if realtime_quote else None
+                )
+                research_ctx = get_research_context(
+                    code, price=price, stock_name=stock_name,
+                )
+                if research_ctx:
+                    enhanced_context["research_context"] = research_ctx
+            except Exception:
+                pass
+
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
             (
                 analysis_context_pack_summary,

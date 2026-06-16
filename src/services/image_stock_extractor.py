@@ -226,13 +226,48 @@ def _resolve_vision_model() -> str:
     return model
 
 
+def _get_channel_for_model(model: str, cfg: Config) -> dict:
+    """Search LLM_CHANNELS for a channel matching the model's provider.
+
+    Prefers channels whose model list contains the requested model name.
+    """
+    provider = model.split("/")[0].lower() if "/" in model else ""
+    model_name = model.split("/", 1)[1] if "/" in model else model
+    fallback = {}
+    for ch in (cfg.llm_channels or []):
+        ch_protocol = (ch.get("protocol") or "").lower()
+        if ch_protocol not in (provider, "openai"):
+            continue
+        keys = [k for k in (ch.get("api_keys") or []) if k and len(k) >= 8]
+        if not keys:
+            continue
+        info = {
+            "api_key": keys[0],
+            "api_base": ch.get("base_url") or "",
+            "protocol": ch_protocol,
+        }
+        if not fallback:
+            fallback = info
+        # Prefer channel that contains this model name
+        ch_models = (ch.get("models") or [])
+        for m in ch_models:
+            if model_name.lower() in str(m).lower():
+                return info
+    return fallback
+
+
 def _get_api_keys_for_model(model: str, cfg: Config) -> List[str]:
     """Return available API keys for the given litellm model."""
     if model.startswith("gemini/") or model.startswith("vertex_ai/"):
         return [k for k in cfg.gemini_api_keys if k and len(k) >= 8]
     if model.startswith("anthropic/"):
         return [k for k in cfg.anthropic_api_keys if k and len(k) >= 8]
-    return [k for k in cfg.openai_api_keys if k and len(k) >= 8]
+    keys = [k for k in cfg.openai_api_keys if k and len(k) >= 8]
+    if keys:
+        return keys
+    # Fallback: search LLM_CHANNELS for OpenAI-compatible keys
+    ch = _get_channel_for_model(model, cfg)
+    return [ch["api_key"]] if ch.get("api_key") else []
 
 
 def _call_litellm_vision(image_b64: str, mime_type: str, api_key: Optional[str] = None) -> str:
@@ -266,9 +301,11 @@ def _call_litellm_vision(image_b64: str, mime_type: str, api_key: Optional[str] 
     }
     # Add api_base and custom headers for OpenAI-compatible providers
     if not model.startswith("gemini/") and not model.startswith("anthropic/") and not model.startswith("vertex_ai/"):
-        if cfg.openai_base_url:
-            call_kwargs["api_base"] = cfg.openai_base_url
-        if cfg.openai_base_url and "aihubmix.com" in cfg.openai_base_url:
+        channel = _get_channel_for_model(model, cfg)
+        api_base = channel.get("api_base") or cfg.openai_base_url
+        if api_base:
+            call_kwargs["api_base"] = api_base
+        if api_base and "aihubmix.com" in api_base:
             call_kwargs["extra_headers"] = {"APP-Code": "GPIJ3886"}
 
     if getattr(litellm, "completion", None) is None:

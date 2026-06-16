@@ -2982,6 +2982,27 @@ class GeminiAnalyzer:
         )
         if daily_market_context_section:
             prompt += daily_market_context_section
+
+        # 北向资金 + 题材归因（新增的中线信号维度）
+        northbound_text = context.get("northbound_context", "")
+        if isinstance(northbound_text, str) and northbound_text.strip():
+            prompt += f"\n## 📊 北向资金流向\n{northbound_text}\n"
+        theme_text = context.get("theme_context", "")
+        if isinstance(theme_text, str) and theme_text.strip():
+            prompt += f"\n## 🏷️ 市场题材热度\n{theme_text}\n"
+        theme_match = context.get("theme_match")
+        if isinstance(theme_match, dict) and theme_match:
+            prompt += (
+                f"\n⚠️ **本股票在今日强势股名单中**: "
+                f"涨幅 {theme_match.get('涨幅%', '?')}%, "
+                f"题材: {theme_match.get('题材归因', '??')}\n"
+            )
+
+        # Research reports & consensus EPS (研报 + 一致预期EPS)
+        research_text = context.get("research_context", "")
+        if isinstance(research_text, str) and research_text.strip():
+            prompt += f"\n## 🏢 机构研报与估值\n{research_text}\n"
+
         if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
             prompt += analysis_context_pack_summary
         prompt += f"""

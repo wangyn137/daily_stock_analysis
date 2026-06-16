@@ -577,6 +577,7 @@ class DataFetcherManager:
     _DAILY_MARKET_FETCHER_SUPPORT = {
         "EfinanceFetcher": {"cn"},
         "TencentFetcher": {"cn"},
+        "WeStockFetcher": {"cn", "hk", "us"},
         "AkshareFetcher": {"cn", "hk"},
         "TushareFetcher": {"cn", "hk"},
         "PytdxFetcher": {"cn"},
@@ -1101,6 +1102,7 @@ class DataFetcherManager:
           4. YfinanceFetcher (Priority 4)
         """
         from src.config import get_config
+        from .westock_fetcher import WeStockFetcher
         from .efinance_fetcher import EfinanceFetcher
         from .tencent_fetcher import TencentFetcher
         from .akshare_fetcher import AkshareFetcher
@@ -1111,6 +1113,7 @@ class DataFetcherManager:
         from .longbridge_fetcher import LongbridgeFetcher
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
+        westock = WeStockFetcher()
         efinance = EfinanceFetcher()
         tencent = TencentFetcher()
         akshare = AkshareFetcher()
@@ -1148,6 +1151,7 @@ class DataFetcherManager:
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
             self._fetchers = [
+                westock,
                 efinance,
                 tencent,
                 akshare,
@@ -1713,7 +1717,17 @@ class DataFetcherManager:
             try:
                 quote = None
                 
-                if source == "efinance":
+                if source == "westock":
+                    fetcher = self._get_fetcher_by_name("WeStockFetcher", capability="realtime_quote")
+                    if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):
+                        record_provider_run_started(
+                            data_type="realtime_quote",
+                            provider=fetcher.name,
+                            operation="get_realtime_quote",
+                        )
+                        quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code)
+
+                elif source == "efinance":
                     fetcher = self._get_fetcher_by_name("EfinanceFetcher", capability="realtime_quote")
                     if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):
                         record_provider_run_started(
