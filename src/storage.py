@@ -1476,6 +1476,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         try:
             def _write(session: Session) -> int:
+                # 去重：同标的同日只保留一条，删除旧记录后写入新记录
+                _today = date.today()
+                session.execute(
+                    delete(AnalysisHistory).where(
+                        AnalysisHistory.code == result.code,
+                        func.date(AnalysisHistory.created_at) == _today,
+                    )
+                )
                 history = AnalysisHistory(
                     query_id=query_id,
                     code=result.code,

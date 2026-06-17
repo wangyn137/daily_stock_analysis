@@ -320,7 +320,15 @@ class TavilySearchProvider(BaseSearchProvider):
             )
         
         try:
-            client = TavilyClient(api_key=api_key)
+            import requests as _requests
+            _session = _requests.Session()
+            # Override send() to enforce a short timeout so Tavily fails fast
+            _original_send = _session.send
+            def _send_with_timeout(req, **kwargs):
+                kwargs.setdefault("timeout", 8)
+                return _original_send(req, **kwargs)
+            _session.send = _send_with_timeout
+            client = TavilyClient(api_key=api_key, session=_session)
             
             # 执行搜索（优化：使用advanced深度、限制最近几天）
             search_kwargs: Dict[str, Any] = {
@@ -1478,6 +1486,154 @@ class MiniMaxSearchProvider(BaseSearchProvider):
         except Exception:
             return f"HTTP {response.status_code}: {response.text[:200]}"
 
+
+class MiaoXiangSearchProvider(BaseSearchProvider):
+    """东方财富妙想金融搜索 (免费，无需 API 轮转).
+
+    Features:
+    - 基于东方财富妙想搜索能力，金融场景信源智能筛选
+    - 返回新闻、公告、研报等结构化金融资讯
+    - 单一 API Key 认证
+
+    API endpoint: POST https://mkapi2.dfcfs.com/finskillshub/api/claw/news-search
+    """
+
+    API_ENDPOINT = "https://mkapi2.dfcfs.com/finskillshub/api/claw/news-search"
+
+    # 资讯类型中文映射
+    _INFO_TYPE_MAP = {
+        "NEWS": "新闻",
+        "INV_NEWS": "新闻",
+        "REPORT": "研报",
+        "ANNOUNCEMENT": "公告",
+        "NOTICE": "公告",
+    }
+
+    def __init__(self, api_keys: List[str]):
+        super().__init__(api_keys, "妙想")
+        self._last_call: float = 0.0
+        # 妙想有频率限制，并发场景下两请求间至少间隔 0.6s
+        self._min_interval: float = 0.6
+        self._rate_lock = threading.Lock()
+
+    @property
+    def is_available(self) -> bool:
+        return bool(self._api_keys)
+
+    def _do_search(
+        self, query: str, api_key: str, max_results: int, days: int = 7
+    ) -> SearchResponse:
+        """Execute 妙想 financial news search (with rate-limit guard)."""
+        # 线程安全频率限制：妙想 API 有 QPS 保护
+        with self._rate_lock:
+            now = time.time()
+            wait = self._min_interval - (now - self._last_call)
+            self._last_call = max(now, self._last_call) + self._min_interval
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "apikey": api_key,
+            }
+            payload = {"query": query}
+
+            response = _post_with_retry(
+                self.API_ENDPOINT, headers=headers, json=payload, timeout=30
+            )
+
+            if response.status_code != 200:
+                error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+                logger.warning("[妙想] 搜索失败: %s", error_msg)
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False, error_message=error_msg,
+                )
+
+            data = response.json()
+
+            # Check API status
+            status = data.get("status", -1)
+            if status != 0:
+                error_msg = data.get("message", f"API status {status}")
+                logger.warning("[妙想] API 返回错误: %s", error_msg)
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False, error_message=error_msg,
+                )
+
+            # Parse nested response: data.data.llmSearchResponse.data
+            inner_data = data.get("data", {})
+            middle = inner_data.get("data", {})
+            search_response = middle.get("llmSearchResponse", {})
+            items = search_response.get("data", [])
+
+            if not items:
+                logger.info("[妙想] 搜索 '%s' 完成，但未找到相关资讯", query)
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=True,
+                )
+
+            results: List[SearchResult] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                title = item.get("title", "") or ""
+                content = item.get("content", "") or ""
+                date_val = item.get("date", "")
+                info_type = item.get("informationType", "")
+                source_label = (
+                    item.get("source")
+                    or item.get("insName")
+                    or self._INFO_TYPE_MAP.get(info_type, info_type)
+                    or ""
+                )
+
+                # 构建摘要：内容 + 类型标注
+                snippet = content[:500] if content else ""
+
+                result = SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=item.get("jumpUrl", ""),
+                    source=source_label,
+                    published_date=date_val,
+                )
+                results.append(result)
+
+                if len(results) >= max_results:
+                    break
+
+            logger.info(
+                "[妙想] 搜索 '%s' 完成，返回 %s 条结果", query, len(results)
+            )
+
+            return SearchResponse(
+                query=query, results=results, provider=self.name, success=True,
+            )
+
+        except requests.exceptions.Timeout:
+            error_msg = "Request timeout"
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=error_msg,
+            )
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Network error: {e}"
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=error_msg,
+            )
+        except Exception as e:
+            error_msg = f"Unexpected error: {e}"
+            logger.error("[妙想] 搜索异常: %s", error_msg)
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=error_msg,
+            )
+
     @staticmethod
     def _extract_domain(url: str) -> str:
         """Extract domain from URL as source label."""
@@ -2262,6 +2418,7 @@ class SearchService:
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
+        miaoxiang_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
@@ -2301,6 +2458,11 @@ class SearchService:
         )
 
         # 初始化搜索引擎（按优先级排序）
+        # 0. 妙想优先（东方财富金融搜索，中文金融场景最优）
+        if miaoxiang_keys:
+            self._providers.append(MiaoXiangSearchProvider(miaoxiang_keys))
+            logger.info(f"已配置 妙想 搜索，共 {len(miaoxiang_keys)} 个 API Key")
+
         # 1. Bocha 优先（中文搜索优化，AI摘要）
         if bocha_keys:
             self._providers.append(BochaSearchProvider(bocha_keys))

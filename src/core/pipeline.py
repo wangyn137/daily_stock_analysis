@@ -164,6 +164,7 @@ class StockAnalysisPipeline:
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
+                miaoxiang_keys=self.config.miaoxiang_api_keys,
                 searxng_base_urls=self.config.searxng_base_urls,
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
                 news_max_age_days=self.config.news_max_age_days,
@@ -515,6 +516,19 @@ class StockAnalysisPipeline:
                         logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
             else:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
+
+            # Eastmoney news (free, no quota) — supplements or replaces Tavily/SearXNG
+            try:
+                from src.services.eastmoney_news_service import get_news_context
+                em_news = get_news_context(code, stock_name=stock_name)
+                if em_news:
+                    if news_context:
+                        news_context = news_context + "\n\n" + em_news
+                    else:
+                        news_context = em_news
+                    logger.info(f"{stock_name}({code}) 东财新闻已注入")
+            except Exception:
+                pass
 
             # Step 4.5: Social sentiment intelligence (US stocks only)
             if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
