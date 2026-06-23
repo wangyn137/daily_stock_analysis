@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Callable
@@ -156,6 +157,9 @@ def _should_hide_regular_session_ohlc(context: Dict[str, Any]) -> bool:
         context,
         phase_context,
     )
+
+
+_DEFAULT_LLM_TIMEOUT = 300  # 5 分钟，防止代理僵死导致进程永久阻塞
 
 
 class _LiteLLMStreamError(RuntimeError):
@@ -2305,6 +2309,8 @@ class GeminiAnalyzer:
         wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
         register_fallback_model_pricing(wire_models)
         effective_kwargs = dict(call_kwargs)
+        # 防止 opencode 等代理僵死导致进程永久阻塞 (#1934)
+        effective_kwargs.setdefault("timeout", _DEFAULT_LLM_TIMEOUT)
         if use_channel_router and self._router and model in router_model_names:
             return self._router.completion(**effective_kwargs)
         if self._router and model == config.litellm_model and not use_channel_router:
@@ -2443,27 +2449,50 @@ class GeminiAnalyzer:
         chars_received = 0
         next_emit_at = 1
 
-        try:
-            for chunk in stream_response:
-                chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
-                normalized_usage = self._normalize_usage(chunk_usage)
-                if normalized_usage:
-                    usage = normalized_usage
+        # 流式消费在后台线程执行，主线程等待，防止迭代器永久阻塞
+        stream_error: Optional[Exception] = None
 
-                delta_text = self._extract_stream_text(chunk)
-                if not delta_text:
-                    continue
+        def _consume() -> None:
+            nonlocal chars_received, usage, stream_error
+            try:
+                for chunk in stream_response:
+                    chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
+                    normalized_usage = self._normalize_usage(chunk_usage)
+                    if normalized_usage:
+                        usage = normalized_usage
 
-                chunks.append(delta_text)
-                chars_received += len(delta_text)
-                if progress_callback and chars_received >= next_emit_at:
-                    progress_callback(chars_received)
-                    next_emit_at = chars_received + 160
-        except Exception as exc:
+                    delta_text = self._extract_stream_text(chunk)
+                    if not delta_text:
+                        continue
+
+                    chunks.append(delta_text)
+                    chars_received += len(delta_text)
+                    if progress_callback and chars_received >= next_emit_at:
+                        progress_callback(chars_received)
+                        next_emit_at = chars_received + 160
+            except Exception as exc:
+                stream_error = exc
+
+        thread = threading.Thread(target=_consume, daemon=True)
+        thread.start()
+        thread.join(timeout=_DEFAULT_LLM_TIMEOUT)
+
+        if thread.is_alive():
+            logger.error(
+                "[LiteLLM] %s stream timed out after %ds, aborting",
+                model,
+                _DEFAULT_LLM_TIMEOUT,
+            )
             raise _LiteLLMStreamError(
-                f"{model} stream interrupted: {exc}",
+                f"{model} stream timed out after {_DEFAULT_LLM_TIMEOUT}s",
                 partial_received=chars_received > 0,
-            ) from exc
+            )
+
+        if stream_error is not None:
+            raise _LiteLLMStreamError(
+                f"{model} stream interrupted: {stream_error}",
+                partial_received=chars_received > 0,
+            ) from stream_error
 
         response_text = "".join(chunks).strip()
         if not response_text:
@@ -2798,6 +2827,7 @@ class GeminiAnalyzer:
             retry_count = 0
             max_retries = config.report_integrity_retry if config.report_integrity_enabled else 0
 
+            cooldown_retried = False
             while True:
                 start_time = time.time()
                 try:
@@ -2819,6 +2849,22 @@ class GeminiAnalyzer:
                         response_text = exc.last_response_text
                         model_used = exc.last_model
                         llm_usage = exc.last_usage
+                    elif not cooldown_retried:
+                        error_text = str(exc)
+                        is_cooldown = (
+                            "cooldown" in error_text.lower()
+                            or "No deployments available" in error_text
+                        )
+                        if is_cooldown:
+                            cooldown_wait = 30
+                            logger.warning(
+                                "[LLM] %s(%s): 所有模型冷却中，等待 %ds 后重试一次",
+                                name, code, cooldown_wait,
+                            )
+                            time.sleep(cooldown_wait)
+                            cooldown_retried = True
+                            continue
+                        raise
                     else:
                         raise
                 elapsed = time.time() - start_time
