@@ -2453,7 +2453,7 @@ class GeminiAnalyzer:
         stream_error: Optional[Exception] = None
 
         def _consume() -> None:
-            nonlocal chars_received, usage, stream_error
+            nonlocal chars_received, next_emit_at, usage, stream_error
             try:
                 for chunk in stream_response:
                     chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
