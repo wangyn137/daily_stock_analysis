@@ -356,7 +356,13 @@ class TestSetupLoggingIntegration:
             log_dir=str(tmp_path),
             dedup_window_seconds=0.05,
             dedup_flush_interval_seconds=0.05,
+            dedup_force_flush_after=5,
         )
+        # setup_logging() clears root handlers; re-attach pytest's caplog handler
+        # so the dedup summary records are visible to caplog.
+        root_logger = logging.getLogger()
+        if caplog.handler not in root_logger.handlers:
+            root_logger.addHandler(caplog.handler)
         test_logger = logging.getLogger("src.dedup_e2e_subject")
         with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
             for _ in range(20):
