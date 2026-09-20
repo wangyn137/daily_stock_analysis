@@ -84,3 +84,72 @@ class TestNormalizeMessage:
         assert "<ADDR>" in result
         assert "<DATE>" in result
         assert "513180" not in result
+
+
+class TestDeduplicationFilterState:
+    def _make_record(self, msg: str, level: int = logging.WARNING, name: str = "src.test"):
+        rec = logging.LogRecord(
+            name=name,
+            level=level,
+            pathname=__file__,
+            lineno=1,
+            msg=msg,
+            args=(),
+            exc_info=None,
+        )
+        return rec
+
+    def test_filter_first_record_passes(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        rec = self._make_record("first message")
+        assert f.filter(rec) is True
+
+    def test_filter_dedupes_subsequent(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        rec = self._make_record("repeat me")
+        assert f.filter(rec) is True
+        rec2 = self._make_record("repeat me")
+        assert f.filter(rec2) is False
+        rec3 = self._make_record("repeat me")
+        assert f.filter(rec3) is False
+
+    def test_filter_always_passes_error(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        rec_err = self._make_record("oops", level=logging.ERROR)
+        assert f.filter(rec_err) is True
+        # A second identical ERROR must also pass (no dedup for ERROR+)
+        rec_err2 = self._make_record("oops", level=logging.ERROR)
+        assert f.filter(rec_err2) is True
+
+    def test_filter_always_passes_critical(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        rec = self._make_record("fatal", level=logging.CRITICAL)
+        assert f.filter(rec) is True
+        rec2 = self._make_record("fatal", level=logging.CRITICAL)
+        assert f.filter(rec2) is True
+
+    def test_filter_different_messages_dont_collide(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        assert f.filter(self._make_record("message A")) is True
+        assert f.filter(self._make_record("message B")) is True
+        assert f.filter(self._make_record("message A")) is False
+        assert f.filter(self._make_record("message B")) is False
+
+    def test_filter_different_loggers_dont_collide(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        assert f.filter(self._make_record("same text", name="src.a")) is True
+        assert f.filter(self._make_record("same text", name="src.b")) is True
+
+    def test_filter_normalizes_before_keying(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        # Two messages differing only by stock code should collide after normalization.
+        assert f.filter(self._make_record("search failed (513180)")) is True
+        assert f.filter(self._make_record("search failed (513180)")) is False
+        assert f.filter(self._make_record("search failed (513181)")) is False
