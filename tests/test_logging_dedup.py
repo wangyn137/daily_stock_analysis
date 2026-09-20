@@ -193,3 +193,111 @@ class TestDeduplicationFilterState:
         finally:
             root.removeHandler(handler)
             root.setLevel(saved_level)
+
+
+class TestDeduplicationFilterFlush:
+    def _make_record(self, msg: str, level: int = logging.WARNING, name: str = "src.test"):
+        return logging.LogRecord(
+            name=name,
+            level=level,
+            pathname=__file__,
+            lineno=1,
+            msg=msg,
+            args=(),
+            exc_info=None,
+        )
+
+    def test_flushes_after_window_emits_summary(self, caplog):
+        cfg = _load_logging_config()
+        # Very short window/interval so first call expires immediately.
+        f = cfg.MessageDeduplicationFilter(
+            window_seconds=0.05, flush_interval_seconds=0.05, force_flush_after=100000
+        )
+        rec = self._make_record("repeatable warn")
+        with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
+            assert f.filter(rec) is True
+            assert f.filter(self._make_record("repeatable warn")) is False
+            time.sleep(0.1)
+            # Trigger force-flush by exceeding silent_count threshold (force_flush_after=100000 won't fire).
+            # Instead: call f.flush() directly to drain all pending buckets.
+            f.flush()
+        summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
+        assert any("[去重汇总]" in r.getMessage() for r in summary_records)
+
+    def test_force_flush_on_max_buckets(self, caplog):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(
+            window_seconds=10.0,
+            flush_interval_seconds=10.0,
+            max_buckets=5,
+        )
+        with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
+            for i in range(7):
+                rec = self._make_record(f"unique-{i}")
+                f.filter(rec)
+        summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
+        # First 5 buckets are filled; the 6th forces flush of all existing buckets,
+        # which emits summaries for all 5 drained buckets. Then the 6th and 7th buckets
+        # are added without summary (still under window).
+        assert len(summary_records) >= 5
+
+    def test_force_flush_after_silent_count(self, caplog):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(
+            window_seconds=10.0,
+            flush_interval_seconds=10.0,
+            force_flush_after=3,
+        )
+        with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
+            assert f.filter(self._make_record("dup msg")) is True
+            for _ in range(5):
+                f.filter(self._make_record("dup msg"))
+        summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
+        assert any("[去重汇总]" in r.getMessage() for r in summary_records)
+
+    def test_thread_safe_no_deadlock(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(
+            window_seconds=10.0, flush_interval_seconds=10.0
+        )
+        import threading
+
+        errors = []
+
+        def worker(prefix: str) -> None:
+            try:
+                for i in range(200):
+                    f.filter(self._make_record(f"{prefix}-{i % 5}"))
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(f"t{i}",)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        assert errors == []
+        assert all(not t.is_alive() for t in threads)
+
+    def test_fail_open_on_exception(self, monkeypatch):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=10.0, flush_interval_seconds=10.0)
+
+        # Force normalize_message to raise inside filter.
+        def boom(_text):
+            raise RuntimeError("simulated internal failure")
+
+        monkeypatch.setattr(cfg, "normalize_message", boom)
+        rec = self._make_record("any text")
+        # Should still pass (fail-open).
+        assert f.filter(rec) is True
+
+    def test_flush_method_emits_pending_summaries(self, caplog):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=999.0, flush_interval_seconds=999.0)
+        with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
+            f.filter(self._make_record("never expires"))
+            f.filter(self._make_record("never expires"))
+            f.flush()
+        summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
+        assert any("[去重汇总]" in r.getMessage() for r in summary_records)
