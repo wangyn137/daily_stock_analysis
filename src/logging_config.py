@@ -223,13 +223,45 @@ def _resolve_litellm_log_level(raw_level: Optional[str] = None) -> Tuple[int, Op
     return level, None
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def setup_logging(
     log_prefix: str = "app",
     log_dir: str = "./logs",
     console_level: Optional[int] = None,
     debug: bool = False,
     extra_quiet_loggers: Optional[List[str]] = None,
-) -> None:
+    dedup_enabled: Optional[bool] = None,
+    dedup_window_seconds: Optional[float] = None,
+    dedup_flush_interval_seconds: Optional[float] = None,
+    dedup_max_buckets: Optional[int] = None,
+    dedup_force_flush_after: Optional[int] = None,
+) -> Optional[MessageDeduplicationFilter]:
     """
     统一的日志系统初始化
 
@@ -238,69 +270,110 @@ def setup_logging(
     2. 常规日志文件：INFO 级别，10MB 轮转，保留 5 个备份
     3. 调试日志文件：DEBUG 级别，50MB 轮转，保留 3 个备份
 
+    日志去重（dedup）：
+    - 通过 MessageDeduplicationFilter 合并重复 WARNING/INFO；
+    - 控制台 + 常规文件 handler 挂该 filter；调试 handler 不挂；
+    - DEBUG 日志文件保留全部细节用于事后排查。
+
     Args:
         log_prefix: 日志文件名前缀（如 "api_server" -> api_server_20240101.log）
         log_dir: 日志文件目录，默认 ./logs
         console_level: 控制台日志级别（可选，优先于 debug 参数）
         debug: 是否启用调试模式（控制台输出 DEBUG 级别）
         extra_quiet_loggers: 额外需要降低日志级别的第三方库列表
+        dedup_enabled: 是否启用去重过滤器；默认读取 LOG_DEDUP 环境变量（默认 true）
+        dedup_window_seconds: 去重窗口；默认读取 LOG_DEDUP_WINDOW_SECONDS（默认 300）
+        dedup_flush_interval_seconds: flush 间隔；默认读取 LOG_DEDUP_FLUSH_INTERVAL_SECONDS（默认 60）
+        dedup_max_buckets: buckets 硬上限；默认读取 LOG_DEDUP_MAX_BUCKETS（默认 10000）
+        dedup_force_flush_after: 静默计数阈值；默认读取 LOG_DEDUP_FORCE_FLUSH_AFTER（默认 100）
+
+    Returns:
+        安装的 MessageDeduplicationFilter 实例；如果 dedup_enabled=False 则返回 None。
     """
-    # 确定控制台日志级别
     if console_level is not None:
         level = console_level
     else:
         level = logging.DEBUG if debug else logging.INFO
 
-    # 创建日志目录
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    # 日志文件路径（按日期分文件）
     today_str = datetime.now().strftime('%Y%m%d')
     log_file = log_path / f"{log_prefix}_{today_str}.log"
     debug_log_file = log_path / f"{log_prefix}_debug_{today_str}.log"
 
-    # 配置根 logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # 根 logger 设为 DEBUG，由 handler 控制输出级别
+    root_logger.setLevel(logging.DEBUG)
 
-    # 清除已有 handler，避免重复添加
     if root_logger.handlers:
         root_logger.handlers.clear()
-    # 创建相对路径 Formatter（相对于项目根目录）
+
     project_root = Path.cwd()
     rel_formatter = RelativePathFormatter(
         LOG_FORMAT, LOG_DATE_FORMAT, relative_to=project_root
     )
-    # Handler 1: 控制台输出
+
+    dedup_enabled_resolved = (
+        dedup_enabled
+        if dedup_enabled is not None
+        else _env_flag("LOG_DEDUP", True)
+    )
+
+    dedup_filter: Optional[MessageDeduplicationFilter] = None
+    if dedup_enabled_resolved:
+        dedup_filter = MessageDeduplicationFilter(
+            window_seconds=(
+                dedup_window_seconds
+                if dedup_window_seconds is not None
+                else _env_float("LOG_DEDUP_WINDOW_SECONDS", 300.0)
+            ),
+            flush_interval_seconds=(
+                dedup_flush_interval_seconds
+                if dedup_flush_interval_seconds is not None
+                else _env_float("LOG_DEDUP_FLUSH_INTERVAL_SECONDS", 60.0)
+            ),
+            max_buckets=(
+                dedup_max_buckets
+                if dedup_max_buckets is not None
+                else _env_int("LOG_DEDUP_MAX_BUCKETS", 10000)
+            ),
+            force_flush_after=(
+                dedup_force_flush_after
+                if dedup_force_flush_after is not None
+                else _env_int("LOG_DEDUP_FORCE_FLUSH_AFTER", 100)
+            ),
+        )
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(rel_formatter)
+    if dedup_filter is not None:
+        console_handler.addFilter(dedup_filter)
     root_logger.addHandler(console_handler)
 
-    # Handler 2: 常规日志文件（INFO 级别，10MB 轮转）
     file_handler = RotatingFileHandler(
         log_file,
-        maxBytes=10 * 1024 * 1024,  # 10MB
+        maxBytes=10 * 1024 * 1024,
         backupCount=5,
-        encoding='utf-8'
+        encoding='utf-8',
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(rel_formatter)
+    if dedup_filter is not None:
+        file_handler.addFilter(dedup_filter)
     root_logger.addHandler(file_handler)
 
-    # Handler 3: 调试日志文件（DEBUG 级别，包含所有详细信息）
     debug_handler = RotatingFileHandler(
         debug_log_file,
-        maxBytes=50 * 1024 * 1024,  # 50MB
+        maxBytes=50 * 1024 * 1024,
         backupCount=3,
-        encoding='utf-8'
+        encoding='utf-8',
     )
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(rel_formatter)
+    # DEBUG handler does NOT get the filter — keep full detail for debugging.
     root_logger.addHandler(debug_handler)
 
-    # 降低第三方库的日志级别
     quiet_loggers = DEFAULT_QUIET_LOGGERS.copy()
     if extra_quiet_loggers:
         quiet_loggers.extend(extra_quiet_loggers)
@@ -312,17 +385,14 @@ def setup_logging(
     for logger_name in LITELLM_LOGGERS:
         logging.getLogger(logger_name).setLevel(litellm_level)
 
-    # 输出初始化完成信息（使用相对路径）
     try:
         rel_log_path = log_path.resolve().relative_to(project_root)
     except ValueError:
         rel_log_path = log_path
-
     try:
         rel_log_file = log_file.resolve().relative_to(project_root)
     except ValueError:
         rel_log_file = log_file
-
     try:
         rel_debug_log_file = debug_log_file.resolve().relative_to(project_root)
     except ValueError:
@@ -338,3 +408,4 @@ def setup_logging(
             _DEFAULT_LITELLM_LOG_LEVEL,
             ", ".join(_ALLOWED_LOG_LEVELS),
         )
+    return dedup_filter
