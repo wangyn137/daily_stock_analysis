@@ -307,3 +307,59 @@ class TestDeduplicationFilterFlush:
             f.flush()
         summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
         assert any("[去重汇总]" in r.getMessage() for r in summary_records)
+
+
+class TestSetupLoggingIntegration:
+    def test_setup_logging_attaches_filter_by_default(self, monkeypatch, tmp_path):
+        cfg = _load_logging_config()
+        monkeypatch.chdir(tmp_path)
+        cfg.setup_logging(log_prefix="dedup_test", log_dir=str(tmp_path))
+        root = logging.getLogger()
+        dedup_filters = [
+            f for h in root.handlers for f in h.filters if isinstance(f, cfg.MessageDeduplicationFilter)
+        ]
+        assert len(dedup_filters) >= 2  # console + file_handler
+
+    def test_setup_logging_disabled_skips_filter(self, monkeypatch, tmp_path):
+        cfg = _load_logging_config()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LOG_DEDUP", "false")
+        # Env var is read at setup_logging() call time, not import time.
+        cfg.setup_logging(log_prefix="dedup_test_off", log_dir=str(tmp_path))
+        root = logging.getLogger()
+        dedup_filters = [
+            f for h in root.handlers for f in h.filters if isinstance(f, cfg.MessageDeduplicationFilter)
+        ]
+        assert dedup_filters == []
+
+    def test_setup_logging_debug_handler_unaffected(self, monkeypatch, tmp_path):
+        cfg = _load_logging_config()
+        monkeypatch.chdir(tmp_path)
+        cfg.setup_logging(log_prefix="dedup_test_debug", log_dir=str(tmp_path))
+        root = logging.getLogger()
+        # The RotatingFileHandler with maxBytes=50MB is the debug handler.
+        debug_handlers = [
+            h
+            for h in root.handlers
+            if hasattr(h, "maxBytes") and h.maxBytes == 50 * 1024 * 1024
+        ]
+        assert len(debug_handlers) == 1
+        assert not any(
+            isinstance(f, cfg.MessageDeduplicationFilter) for f in debug_handlers[0].filters
+        )
+
+    def test_setup_logging_end_to_end_dedupes_repeats(self, monkeypatch, tmp_path, caplog):
+        cfg = _load_logging_config()
+        monkeypatch.chdir(tmp_path)
+        cfg.setup_logging(
+            log_prefix="dedup_e2e",
+            log_dir=str(tmp_path),
+            dedup_window_seconds=0.05,
+            dedup_flush_interval_seconds=0.05,
+        )
+        test_logger = logging.getLogger("src.dedup_e2e_subject")
+        with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
+            for _ in range(20):
+                test_logger.warning("identical warning %s", 513180)
+        caplog_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
+        assert any("[去重汇总]" in r.getMessage() for r in caplog_records)
