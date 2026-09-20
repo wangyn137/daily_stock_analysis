@@ -153,3 +153,11 @@ class TestDeduplicationFilterState:
         assert f.filter(self._make_record("search failed (513180)")) is True
         assert f.filter(self._make_record("search failed (513180)")) is False
         assert f.filter(self._make_record("search failed (513181)")) is False
+
+    def test_filter_dedupes_info_subsequent(self):
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        # INFO records must also be deduped (not just WARNING)
+        assert f.filter(self._make_record("info message", level=logging.INFO)) is True
+        assert f.filter(self._make_record("info message", level=logging.INFO)) is False
+        assert f.filter(self._make_record("info message", level=logging.INFO)) is False
