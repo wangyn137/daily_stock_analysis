@@ -12,11 +12,38 @@
 
 import logging
 import os
+import re
 import sys
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+SUMMARY_LOGGER_NAME = "src.logging_config.dedup"
+
+_URL_RE = re.compile(r"https?://\S+?(?=[\s,)\]>}]|\b\d{6}\b|$)")
+_STOCK_CODE_RE = re.compile(r"\b\d{6}\b")
+_HEX_ADDR_RE = re.compile(r"0x[0-9a-fA-F]+")
+_RETRY_TOTAL_RE = re.compile(r"Retry\(total=\d+\)")
+_IP_PORT_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b")
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def normalize_message(text: str) -> str:
+    """Replace variable fields (URL/code/IP/address/retry counter/date) with placeholders."""
+    if not text:
+        return text
+    text = _URL_RE.sub("<URL>", text)
+    text = _STOCK_CODE_RE.sub("<CODE>", text)
+    text = _HEX_ADDR_RE.sub("<ADDR>", text)
+    text = _RETRY_TOTAL_RE.sub("Retry(total=<N>)", text)
+    text = _IP_PORT_RE.sub("<IP>:<PORT>", text)
+    text = _ISO_DATE_RE.sub("<DATE>", text)
+    return text
 
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(pathname)s:%(lineno)d | %(message)s"
