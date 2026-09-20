@@ -117,7 +117,8 @@ class MessageDeduplicationFilter(logging.Filter):
                 bucket.last_seen = now
                 self._silent_count += 1
                 if self._silent_count >= self.force_flush_after:
-                    pending_summaries.extend(self._collect_expired_buckets_locked(now))
+                    # force_flush_after: drain ALL pending buckets (not just expired ones)
+                    pending_summaries.extend(self._collect_all_buckets_locked())
         for b in pending_summaries:
             self._emit_summary(b)
         return is_first_record
