@@ -16,11 +16,11 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 SUMMARY_LOGGER_NAME = "src.logging_config.dedup"
@@ -104,7 +104,7 @@ class MessageDeduplicationFilter(logging.Filter):
         pending_summaries: List[_Bucket] = []
         is_first_record = False
         with self._lock:
-            self._maybe_flush_locked(now)
+            pending_summaries.extend(self._maybe_flush_locked(now))
             bucket = self._buckets.get(key)
             if bucket is None:
                 if len(self._buckets) >= self.max_buckets:
@@ -128,10 +128,14 @@ class MessageDeduplicationFilter(logging.Filter):
             self._emit_summary(b)
         return is_first_record
 
-    def _maybe_flush_locked(self, now: float) -> None:
+    def _maybe_flush_locked(self, now: float) -> List[_Bucket]:
+        """If the periodic flush interval has elapsed, drain expired buckets.
+        Returns the list of drained buckets; the caller emits summaries
+        OUTSIDE the lock to avoid re-entrant deadlock (see _filter_unsafe).
+        """
         if now - self._last_flush_monotonic < self.flush_interval_seconds:
-            return
-        self._last_flush_monotonic = now
+            return []
+        return self._collect_expired_buckets_locked(now)
 
     def _collect_expired_buckets_locked(self, now: float) -> List[_Bucket]:
         expired_keys = [

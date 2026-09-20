@@ -177,7 +177,6 @@ class TestDeduplicationFilterState:
         handler.addFilter(f)
         root = logging.getLogger()
         saved_level = root.level
-        saved_handlers = list(root.handlers)
         root.addHandler(handler)
         root.setLevel(logging.INFO)
         try:
@@ -241,6 +240,31 @@ class TestDeduplicationFilterFlush:
         assert any("[去重汇总]" in r.getMessage() for r in summary_records)
         # Specifically, the expiring warn bucket should be the one summarized.
         assert any("expiring warn" in r.getMessage() for r in summary_records)
+
+    def test_window_expires_via_periodic_flush_emits_summary(self, caplog):
+        """The periodic _maybe_flush_locked path (driven by flush_interval_seconds)
+        must drain buckets whose age >= window_seconds and emit summaries.
+        """
+        cfg = _load_logging_config()
+        # Short window AND short flush_interval so periodic drain fires.
+        # Disable force_flush_after and max_buckets to ensure ONLY the periodic
+        # path produces summaries.
+        f = cfg.MessageDeduplicationFilter(
+            window_seconds=0.05,
+            flush_interval_seconds=0.05,
+            force_flush_after=100000,
+            max_buckets=100000,
+        )
+        with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
+            assert f.filter(self._make_record("periodic warn")) is True
+            # Wait past the flush interval to trigger _maybe_flush_locked.
+            time.sleep(0.1)
+            # The next call triggers _maybe_flush_locked, which drains the
+            # expired "periodic warn" bucket.
+            f.filter(self._make_record("kicker"))
+        summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
+        assert any("[去重汇总]" in r.getMessage() for r in summary_records)
+        assert any("periodic warn" in r.getMessage() for r in summary_records)
 
     def test_force_flush_on_max_buckets(self, caplog):
         cfg = _load_logging_config()
