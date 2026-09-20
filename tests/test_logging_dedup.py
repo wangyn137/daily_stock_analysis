@@ -207,22 +207,28 @@ class TestDeduplicationFilterFlush:
             exc_info=None,
         )
 
-    def test_flushes_after_window_emits_summary(self, caplog):
+    def test_window_expires_then_flush_emits_summary(self, caplog):
         cfg = _load_logging_config()
-        # Very short window/interval so first call expires immediately.
+        # Short window, disable force-flush paths so only window-expiry drain fires.
         f = cfg.MessageDeduplicationFilter(
-            window_seconds=0.05, flush_interval_seconds=0.05, force_flush_after=100000
+            window_seconds=0.05,
+            flush_interval_seconds=999.0,
+            force_flush_after=100000,
+            max_buckets=100000,
         )
-        rec = self._make_record("repeatable warn")
         with caplog.at_level(logging.INFO, logger=cfg.SUMMARY_LOGGER_NAME):
-            assert f.filter(rec) is True
-            assert f.filter(self._make_record("repeatable warn")) is False
+            assert f.filter(self._make_record("expiring warn")) is True
+            assert f.filter(self._make_record("expiring warn")) is False
+            # Wait past window so the bucket is "expired" by age.
             time.sleep(0.1)
-            # Trigger force-flush by exceeding silent_count threshold (force_flush_after=100000 won't fire).
-            # Instead: call f.flush() directly to drain all pending buckets.
+            # Insert another record — this triggers _maybe_flush_locked (which only updates timer),
+            # but doesn't drain. Then call flush() to drain the now-expired bucket.
+            f.filter(self._make_record("kicker"))
             f.flush()
         summary_records = [r for r in caplog.records if r.name == cfg.SUMMARY_LOGGER_NAME]
         assert any("[去重汇总]" in r.getMessage() for r in summary_records)
+        # Specifically, the expiring warn bucket should be the one summarized.
+        assert any("expiring warn" in r.getMessage() for r in summary_records)
 
     def test_force_flush_on_max_buckets(self, caplog):
         cfg = _load_logging_config()
