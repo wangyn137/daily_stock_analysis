@@ -46,6 +46,114 @@ def normalize_message(text: str) -> str:
     return text
 
 
+@dataclass
+class _Bucket:
+    first_seen: float
+    last_seen: float
+    count: int
+    first_record: logging.LogRecord
+    normalized_key: str
+
+
+class MessageDeduplicationFilter(logging.Filter):
+    """logging.Filter that silences duplicate WARNING/INFO records.
+
+    - First record for a (level, logger, normalized_message) bucket passes through.
+    - Subsequent duplicates are silenced; a summary line is emitted when the bucket
+      expires (>= window_seconds since first_seen) or after `force_flush_after`
+      silent duplicates.
+    - ERROR/CRITICAL records always pass through.
+    - Summary lines are emitted via the dedicated SUMMARY_LOGGER_NAME logger to
+      avoid being re-captured by this same filter.
+    """
+
+    def __init__(
+        self,
+        window_seconds: float = 300.0,
+        flush_interval_seconds: float = 60.0,
+        max_buckets: int = 10000,
+        force_flush_after: int = 100,
+    ) -> None:
+        super().__init__()
+        self.window_seconds = float(window_seconds)
+        self.flush_interval_seconds = float(flush_interval_seconds)
+        self.max_buckets = int(max_buckets)
+        self.force_flush_after = int(force_flush_after)
+        self._buckets: Dict[Tuple[int, str, str], _Bucket] = {}
+        self._silent_count = 0
+        self._last_flush_monotonic = time.monotonic()
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return self._filter_unsafe(record)
+        except Exception:  # pragma: no cover - fail-open
+            return True
+
+    def _filter_unsafe(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            return True
+        normalized = normalize_message(record.getMessage())
+        key = (record.levelno, record.name, normalized)
+        now = time.monotonic()
+        with self._lock:
+            self._maybe_flush_locked(now)
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= self.max_buckets:
+                    self._force_flush_all_locked()
+                self._buckets[key] = _Bucket(
+                    first_seen=now,
+                    last_seen=now,
+                    count=1,
+                    first_record=record,
+                    normalized_key=normalized,
+                )
+                return True
+            bucket.count += 1
+            bucket.last_seen = now
+            self._silent_count += 1
+            if self._silent_count >= self.force_flush_after:
+                self._flush_window_expired_locked(now)
+            return False
+
+    def _maybe_flush_locked(self, now: float) -> None:
+        if now - self._last_flush_monotonic < self.flush_interval_seconds:
+            return
+        self._flush_window_expired_locked(now)
+
+    def _flush_window_expired_locked(self, now: float) -> None:
+        expired_keys = [
+            k for k, b in self._buckets.items() if now - b.first_seen >= self.window_seconds
+        ]
+        for key in expired_keys:
+            bucket = self._buckets.pop(key)
+            self._emit_summary(bucket)
+        self._silent_count = 0
+        self._last_flush_monotonic = now
+
+    def _force_flush_all_locked(self) -> None:
+        for bucket in self._buckets.values():
+            self._emit_summary(bucket)
+        self._buckets.clear()
+        self._silent_count = 0
+        self._last_flush_monotonic = time.monotonic()
+
+    def _emit_summary(self, bucket: _Bucket) -> None:
+        duration = max(0, int(bucket.last_seen - bucket.first_seen))
+        summary_text = (
+            f"[去重汇总] {bucket.first_record.name}.{bucket.first_record.levelname} "
+            f"{bucket.first_record.getMessage()} "
+            f"在 {duration} 秒内出现 {bucket.count} 次"
+        )
+        logging.getLogger(SUMMARY_LOGGER_NAME).info(summary_text)
+
+    def flush(self) -> None:
+        """Force-emit summaries for all buckets (used at shutdown / tests)."""
+        with self._lock:
+            self._force_flush_all_locked()
+
+
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(pathname)s:%(lineno)d | %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _ALLOWED_LOG_LEVELS = {
