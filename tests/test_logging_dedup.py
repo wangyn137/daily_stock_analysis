@@ -194,6 +194,18 @@ class TestDeduplicationFilterState:
             root.removeHandler(handler)
             root.setLevel(saved_level)
 
+    def test_filter_skips_summary_logger_records(self):
+        """Summary records (logger name == SUMMARY_LOGGER_NAME) must skip the filter
+        to prevent self-recursion: a summary emitted by the filter would otherwise
+        get bucketed against itself, causing unbounded message growth.
+        """
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(window_seconds=60, flush_interval_seconds=60)
+        # A summary record must pass through, never be silenced.
+        for _ in range(10):
+            rec = self._make_record("summary line", level=logging.INFO, name=cfg.SUMMARY_LOGGER_NAME)
+            assert f.filter(rec) is True
+
 
 class TestDeduplicationFilterFlush:
     def _make_record(self, msg: str, level: int = logging.WARNING, name: str = "src.test"):

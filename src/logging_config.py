@@ -91,6 +91,11 @@ class MessageDeduplicationFilter(logging.Filter):
             return True
 
     def _filter_unsafe(self, record: logging.LogRecord) -> bool:
+        # Skip summary records to prevent self-recursion: a summary emitted by
+        # this filter would otherwise re-enter and get bucketed against itself,
+        # causing unbounded message growth.
+        if record.name == SUMMARY_LOGGER_NAME:
+            return True
         if record.levelno >= logging.ERROR:
             return True
         normalized = normalize_message(record.getMessage())
