@@ -74,3 +74,13 @@ class TestNormalizeMessage:
         assert "<CODE>" in result
         assert "<ADDR>" in result
         assert "<DATE>" in result
+
+    def test_url_stops_before_six_digit_token(self):
+        cfg = _load_logging_config()
+        text = "[warn] https://api.example.com/q?code=513180 at 0x10abcf00 on 2026-09-17"
+        result = cfg.normalize_message(text)
+        assert "<URL>" in result
+        assert "<CODE>" in result
+        assert "<ADDR>" in result
+        assert "<DATE>" in result
+        assert "513180" not in result
