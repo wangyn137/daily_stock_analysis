@@ -96,12 +96,14 @@ class MessageDeduplicationFilter(logging.Filter):
         normalized = normalize_message(record.getMessage())
         key = (record.levelno, record.name, normalized)
         now = time.monotonic()
+        pending_summaries: List[_Bucket] = []
+        is_first_record = False
         with self._lock:
             self._maybe_flush_locked(now)
             bucket = self._buckets.get(key)
             if bucket is None:
                 if len(self._buckets) >= self.max_buckets:
-                    self._force_flush_all_locked()
+                    pending_summaries.extend(self._collect_all_buckets_locked())
                 self._buckets[key] = _Bucket(
                     first_seen=now,
                     last_seen=now,
@@ -109,35 +111,38 @@ class MessageDeduplicationFilter(logging.Filter):
                     first_record=record,
                     normalized_key=normalized,
                 )
-                return True
-            bucket.count += 1
-            bucket.last_seen = now
-            self._silent_count += 1
-            if self._silent_count >= self.force_flush_after:
-                self._flush_window_expired_locked(now)
-            return False
+                is_first_record = True
+            else:
+                bucket.count += 1
+                bucket.last_seen = now
+                self._silent_count += 1
+                if self._silent_count >= self.force_flush_after:
+                    pending_summaries.extend(self._collect_expired_buckets_locked(now))
+        for b in pending_summaries:
+            self._emit_summary(b)
+        return is_first_record
 
     def _maybe_flush_locked(self, now: float) -> None:
         if now - self._last_flush_monotonic < self.flush_interval_seconds:
             return
-        self._flush_window_expired_locked(now)
+        self._last_flush_monotonic = now
 
-    def _flush_window_expired_locked(self, now: float) -> None:
+    def _collect_expired_buckets_locked(self, now: float) -> List[_Bucket]:
         expired_keys = [
             k for k, b in self._buckets.items() if now - b.first_seen >= self.window_seconds
         ]
-        for key in expired_keys:
-            bucket = self._buckets.pop(key)
-            self._emit_summary(bucket)
-        self._silent_count = 0
-        self._last_flush_monotonic = now
+        result = [self._buckets.pop(k) for k in expired_keys]
+        if expired_keys:
+            self._silent_count = 0
+            self._last_flush_monotonic = now
+        return result
 
-    def _force_flush_all_locked(self) -> None:
-        for bucket in self._buckets.values():
-            self._emit_summary(bucket)
+    def _collect_all_buckets_locked(self) -> List[_Bucket]:
+        result = list(self._buckets.values())
         self._buckets.clear()
         self._silent_count = 0
         self._last_flush_monotonic = time.monotonic()
+        return result
 
     def _emit_summary(self, bucket: _Bucket) -> None:
         duration = max(0, int(bucket.last_seen - bucket.first_seen))
@@ -151,7 +156,9 @@ class MessageDeduplicationFilter(logging.Filter):
     def flush(self) -> None:
         """Force-emit summaries for all buckets (used at shutdown / tests)."""
         with self._lock:
-            self._force_flush_all_locked()
+            pending = self._collect_all_buckets_locked()
+        for b in pending:
+            self._emit_summary(b)
 
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(pathname)s:%(lineno)d | %(message)s"

@@ -5,6 +5,7 @@ import importlib
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -161,3 +162,34 @@ class TestDeduplicationFilterState:
         assert f.filter(self._make_record("info message", level=logging.INFO)) is True
         assert f.filter(self._make_record("info message", level=logging.INFO)) is False
         assert f.filter(self._make_record("info message", level=logging.INFO)) is False
+
+    def test_filter_emit_summary_does_not_deadlock_with_filter_attached(self):
+        """Regression: _emit_summary calls logger.info while holding _lock.
+        If the summary logger's handlers carry this same filter, this would
+        deadlock (re-entrant acquire of non-reentrant Lock). Verify it does not.
+        """
+        import threading
+        cfg = _load_logging_config()
+        f = cfg.MessageDeduplicationFilter(
+            window_seconds=0.05, flush_interval_seconds=0.05
+        )
+        handler = logging.StreamHandler()
+        handler.addFilter(f)
+        root = logging.getLogger()
+        saved_level = root.level
+        saved_handlers = list(root.handlers)
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+        try:
+            def worker():
+                for _ in range(50):
+                    f.filter(self._make_record("biz message"))
+                    time.sleep(0.001)
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(timeout=2.0)
+            assert not t.is_alive(), "filter deadlocked when summary re-enters filter"
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(saved_level)
