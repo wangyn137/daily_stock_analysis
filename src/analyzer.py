@@ -808,6 +808,12 @@ def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> N
     """When chip_data exists, fill chip_structure placeholder fields from chip_data (in-place)."""
     if not result or not _has_meaningful_chip_data(chip_data):
         return
+    # Defensive: when LLM returns dashboard as a non-dict (e.g. list after a
+    # schema validation failure), skip the fill rather than crash with
+    # 'list' object has no attribute 'get'. Only None triggers initialization
+    # to {}; other non-dict types (list, str, int) are left as-is.
+    if result.dashboard is not None and not isinstance(result.dashboard, dict):
+        return
     try:
         if not result.dashboard:
             result.dashboard = {}

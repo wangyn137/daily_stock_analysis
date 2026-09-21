@@ -320,3 +320,29 @@ class TestFillChipStructureIfNeeded(unittest.TestCase):
         self.assertEqual(cs["avg_cost"], 1850.0)
         self.assertEqual(cs["concentration"], "0.00%")
         self.assertNotIn("chip_unavailable_reason", dp)
+
+    def test_no_crash_when_dashboard_is_list(self) -> None:
+        """Regression: when LLM returns dashboard as a list (schema validation
+        failure path), fill_chip_structure_if_needed must early-return instead
+        of crashing with 'list' object has no attribute 'get' at line 816.
+        """
+        result = self._make_result(dashboard=["invalid", "list", "shape"])
+        chip = self._make_chip()
+        # Must not raise
+        fill_chip_structure_if_needed(result, chip)
+        # Dashboard must remain unchanged (list preserved, no mutation to dict)
+        self.assertEqual(result.dashboard, ["invalid", "list", "shape"])
+
+    def test_no_crash_when_dashboard_is_scalar(self) -> None:
+        """Regression: when LLM returns dashboard as a scalar (None/str/int),
+        fill_chip_structure_if_needed must early-return.
+        """
+        result = self._make_result(dashboard=None)
+        chip = self._make_chip()
+        # Must not raise
+        fill_chip_structure_if_needed(result, chip)
+        # When dashboard is None, behavior is to initialize to {} (existing test
+        # covers this). When dashboard is a non-dict non-None value, must leave alone.
+        result2 = self._make_result(dashboard="scalar")
+        fill_chip_structure_if_needed(result2, chip)
+        self.assertEqual(result2.dashboard, "scalar")
